@@ -102,12 +102,13 @@ def main():
         print(num_tokens_from_messages([{"role": "user", "content": " ".join(args.string)}]))
         return
     client = openai.OpenAI(api_key=args.token)
-    userchat = [
-        {"role": "user", "content": " ".join(args.string)}
-    ]
-    response = ask(client, userchat, args.temperature)
-    userchat.append({"role": "assistant", "content": response})
     if args.stream:
+        userchat = [
+            {"role": "system","content": "You are a cute cat running in a command line interface. The user can chat with you and the conversation can be continued."},
+            {"role": "user", "content": " ".join(args.string)}
+        ]
+        response = ask(client, userchat, args.temperature)
+        userchat.append({"role": "assistant", "content": response})
         while True:
             userInput = input()
             if userInput == "exit":
@@ -115,6 +116,13 @@ def main():
             userchat.append({"role": "user", "content": userInput})
             response = ask(client, userchat)
             userchat.append({"role": "assistant", "content": response})
+    else:
+        userchat = [
+            {"role": "system", "content": "You are a cute cat runs in a command line interface and you can only respond once to the user. Do not ask any questions in your response."},
+            {"role": "user", "content": " ".join(args.string)}
+        ]
+        response = ask(client, userchat, args.temperature)
+        userchat.append({"role": "assistant", "content": response})
 
 
 if __name__ == '__main__':
