@@ -7,15 +7,17 @@ import tiktoken
 import dotenv
 from sys import stdout
 
-ASK_GLOBAL_APIKEY=os.getenv("OPENAI_API_KEY")
-if not ASK_GLOBAL_APIKEY and os.path.exists(".env"):
-        dotenv.load_dotenv(".env")
+DEFAULT_MODEL = "gpt-4o-mini"
 
+ASK_GLOBAL_APIKEY=os.getenv("OPENAI_API_KEY")
 ASK_GLOBAL_MODEL=os.getenv("ASK_GLOBAL_MODEL")
-if not ASK_GLOBAL_APIKEY:
-    ASK_GLOBAL_APIKEY=os.getenv("OPENAI_API_KEY")
-if not ASK_GLOBAL_MODEL:
-    ASK_GLOBAL_MODEL = "gpt-4o-mini"
+
+if (not ASK_GLOBAL_APIKEY or not ASK_GLOBAL_MODEL) and os.path.exists(".env"):
+    dotenv.load_dotenv(".env")
+    if not ASK_GLOBAL_APIKEY: ASK_GLOBAL_APIKEY=os.getenv("OPENAI_API_KEY")
+    if not ASK_GLOBAL_MODEL: ASK_GLOBAL_MODEL=os.getenv("ASK_GLOBAL_MODEL")
+
+if not ASK_GLOBAL_MODEL:ASK_GLOBAL_MODEL = DEFAULT_MODEL
 if not ASK_GLOBAL_APIKEY:
     if not os.path.exists(".env"):
         open(".env", "w").write(f"OPENAI_API_KEY=sk-xxxxxxxxxx\nASK_GLOBAL_MODEL={ASK_GLOBAL_MODEL}\n")
@@ -52,14 +54,14 @@ def parser():
     parser = argparse.ArgumentParser(description="OpenAI Chatbot")
     parser.add_argument("--token", "-t", help="Set the token for the chatbot", type=str, default=ASK_GLOBAL_APIKEY,
                         required=False)
-    parser.add_argument("--model", "-m", help="Set the model for the chatbot", type=str, default=ASK_GLOBAL_MODEL, required=False)
+    parser.add_argument("--model", "-m", help="Set the model for current chatbot", type=str, default=ASK_GLOBAL_MODEL, required=False)
     parser.add_argument("--version", "-v", help="Show the version of the chatbot", action="store_true")
     parser.add_argument("--tokenCount", help="Set the token for the chatbot", action="store_true")
     parser.add_argument("--stream", "-s", help="Don't close chat completion and wait for more input", action="store_true", required=False)
     parser.add_argument("--temperature", "-T", help="Set the temperature for the chatbot", type=float, default=0.7, required=False)
     parser.add_argument("--tokenLimit", "-l", help="Set the token limit for the chatbot", type=int, default=tokenLimit, required=False)
-    parser.add_argument("--setapikey", help="Set the token of openai apikey", type=str, required=False)
-    parser.add_argument("--setmodel", help="Set the model for all chats", type=str, required=False)
+    parser.add_argument("--setAPIKey", help="Set the token of openai apikey", type=str, required=False, default="")
+    parser.add_argument("--setModel", help="Set the model for all chats", type=str, required=False, default="")
     parser.add_argument("string", help="Questions", type=str, nargs='*')
     return parser.parse_args()
 
@@ -84,11 +86,11 @@ def ask(client: openai.OpenAI, messages: list, temperature=0.7):
 def main():
     global ASK_GLOBAL_APIKEY, ASK_GLOBAL_MODEL
     args = parser()
-    if args.setmodel or args.setapikey:
-        if args.setmodel: ASK_GLOBAL_MODEL = args.setmodel
-        if args.setapikey: ASK_GLOBAL_APIKEY = args.setapikey
+    if args.setAPIKey or args.setModel:
+        if args.setModel: ASK_GLOBAL_MODEL = args.setModel
+        if args.setAPIKey: ASK_GLOBAL_APIKEY = args.setAPIKey
         open(".env", "w").write(f"OPENAI_API_KEY={ASK_GLOBAL_APIKEY}\nASK_GLOBAL_MODEL={ASK_GLOBAL_MODEL}\n")
-        print("Remember to upgrade tiktoken with newer model")
+        print("Remember to upgrade tiktoken with newer model if you use stream")
         return
     if args.version:
         print("OpenAI Chatbot")
