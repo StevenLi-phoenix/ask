@@ -741,6 +741,9 @@ int main(int argc, char *argv[]) {
         
         char user_input[MAX_BUFFER_SIZE];
         while (true) {
+            printf("> "); // Add a prompt to indicate waiting for user input
+            fflush(stdout); // Ensure the prompt is displayed immediately
+            
             if (!fgets(user_input, MAX_BUFFER_SIZE, stdin)) {
                 log_message(LOG_WARN, "Failed to read user input, exiting");
                 break;
