@@ -7,12 +7,17 @@
 #include <cjson/cJSON.h>
 #include <time.h>
 #include <stdarg.h>
+#include <sys/stat.h>
+#include <limits.h>
 
 #define DEFAULT_MODEL "gpt-4o-mini"
 #define MAX_ENV_VALUE_SIZE 1024
 #define MAX_BUFFER_SIZE 8192
 #define DEFAULT_TOKEN_LIMIT 128000
 #define MAX_MESSAGES 100
+#define MAX_MODELS 200
+#define MODELS_CACHE_FILE ".models_cache.json"
+#define MODELS_CACHE_EXPIRY 86400 // 24 hours in seconds
 
 // Log levels
 typedef enum {
@@ -26,6 +31,7 @@ typedef enum {
 typedef struct {
     char *data;
     size_t size;
+    bool stream_enabled;
 } ResponseBuffer;
 
 typedef struct {
@@ -38,6 +44,18 @@ typedef struct {
     int count;
 } MessageList;
 
+// Model validation
+typedef struct {
+    char id[MAX_ENV_VALUE_SIZE];
+    time_t created;
+} ModelInfo;
+
+typedef struct {
+    ModelInfo models[MAX_MODELS];
+    int count;
+    time_t last_updated;
+} ModelsCache;
+
 // Global variables
 char global_api_key[MAX_ENV_VALUE_SIZE] = {0};
 char global_model[MAX_ENV_VALUE_SIZE] = {0};
@@ -47,21 +65,28 @@ LogLevel log_level = LOG_INFO;
 FILE *log_file = NULL;
 bool log_to_file = false;
 char log_file_path[MAX_ENV_VALUE_SIZE] = "ask.log";
+ModelsCache models_cache = {0};
 
 // Function prototypes
 void load_dotenv(const char *filename);
 size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp);
 int count_tokens_from_messages(MessageList *messages, const char *model);
-void ask(CURL *curl, MessageList *messages, double temperature);
+void ask(CURL *curl, MessageList *messages, double temperature, bool no_stream);
 void add_message(MessageList *messages, const char *role, const char *content);
 void free_messages(MessageList *messages);
-void parse_arguments(int argc, char *argv[], bool *stream_mode, double *temperature, 
+void parse_arguments(int argc, char *argv[], bool *continue_mode, bool *no_stream, double *temperature, 
                     char **input_text, size_t *input_text_len);
 void save_env_file();
 void init_logging(void);
 void close_logging(void);
 void log_message(LogLevel level, const char *format, ...);
 void print_help(void);
+bool validate_model(CURL *curl, const char *model);
+bool load_models_cache(void);
+bool save_models_cache(void);
+bool fetch_models_list(CURL *curl);
+bool is_valid_model(const char *model);
+void suggest_similar_model(const char *invalid_model);
 
 // Initialize logging
 void init_logging(void) {
@@ -165,19 +190,68 @@ size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     ResponseBuffer *mem = (ResponseBuffer *)userp;
     
+    // Allocate/reallocate memory for the buffer
     char *ptr = realloc(mem->data, mem->size + realsize + 1);
     if (!ptr) {
         log_message(LOG_ERROR, "Out of memory when processing API response");
         return 0;
     }
     
+    // Copy the received data to the buffer
     mem->data = ptr;
     memcpy(&(mem->data[mem->size]), contents, realsize);
     mem->size += realsize;
     mem->data[mem->size] = 0;
     
-    log_message(LOG_DEBUG, "Received %zu bytes from API", realsize);
+    // Process streaming data if it's a streaming response
+    if (mem->stream_enabled) {
+        // Find complete "data:" lines in the new chunk
+        char *data = mem->data;
+        char *line_start = data;
+        char *line_end;
+        
+        // Process all complete lines ending with \n\n
+        while ((line_end = strstr(line_start, "\n\n")) != NULL) {
+            *line_end = '\0';  // Temporarily terminate the line
+            
+            // Skip empty lines and [DONE] marker
+            if (strncmp(line_start, "data: ", 6) == 0 && 
+                strcmp(line_start + 6, "[DONE]") != 0) {
+                
+                // Parse the JSON payload
+                cJSON *json = cJSON_Parse(line_start + 6);
+                if (json) {
+                    cJSON *choices = cJSON_GetObjectItem(json, "choices");
+                    if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
+                        cJSON *choice = cJSON_GetArrayItem(choices, 0);
+                        cJSON *delta = cJSON_GetObjectItem(choice, "delta");
+                        
+                        if (delta) {
+                            cJSON *content = cJSON_GetObjectItem(delta, "content");
+                            if (content && cJSON_IsString(content) && content->valuestring) {
+                                // Output the content as it arrives
+                                printf("%s", content->valuestring);
+                                fflush(stdout);  // Force flush to show progress
+                            }
+                        }
+                    }
+                    cJSON_Delete(json);
+                }
+            }
+            
+            line_start = line_end + 2;  // Move to next line after the \n\n
+        }
+        
+        // If we processed some lines, shift the buffer to remove processed data
+        if (line_start > data) {
+            size_t remaining = mem->size - (line_start - data);
+            memmove(data, line_start, remaining);
+            mem->size = remaining;
+            data[mem->size] = '\0';
+        }
+    }
     
+    log_message(LOG_DEBUG, "Received %zu bytes from API", realsize);
     return realsize;
 }
 
@@ -229,14 +303,14 @@ void free_messages(MessageList *messages) {
 }
 
 // Simulate the ask function using CURL to call OpenAI API
-void ask(CURL *curl, MessageList *messages, double temperature) {
+void ask(CURL *curl, MessageList *messages, double temperature, bool no_stream) {
     if (messages->count == 0) {
         log_message(LOG_WARN, "No messages to send to API");
         return;
     }
     
-    log_message(LOG_INFO, "Sending request to OpenAI API (model: %s, temp: %.2f)", 
-                global_model, temperature);
+    log_message(LOG_INFO, "Sending request to OpenAI API (model: %s, temp: %.2f, stream: %s)", 
+                global_model, temperature, no_stream ? "disabled" : "enabled");
     
     // Ensure we're within token limit by removing oldest messages
     int original_count = messages->count;
@@ -261,7 +335,7 @@ void ask(CURL *curl, MessageList *messages, double temperature) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "model", global_model);
     cJSON_AddNumberToObject(root, "temperature", temperature);
-    cJSON_AddBoolToObject(root, "stream", true);
+    cJSON_AddBoolToObject(root, "stream", !no_stream);
     
     cJSON *message_array = cJSON_CreateArray();
     for (int i = 0; i < messages->count; i++) {
@@ -290,6 +364,7 @@ void ask(CURL *curl, MessageList *messages, double temperature) {
     ResponseBuffer buffer;
     buffer.data = malloc(1);
     buffer.size = 0;
+    buffer.stream_enabled = !no_stream;  // Set streaming flag based on mode
     
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&buffer);
     
@@ -303,46 +378,31 @@ void ask(CURL *curl, MessageList *messages, double temperature) {
         log_message(LOG_INFO, "Request completed successfully");
         log_message(LOG_DEBUG, "Response size: %zu bytes", buffer.size);
         
-        // Parse the streaming response and extract content
-        char full_response[MAX_BUFFER_SIZE] = {0};
-        char *line_start, *line_end;
-        line_start = buffer.data;
-        
-        while ((line_end = strstr(line_start, "\n\n")) != NULL) {
-            *line_end = '\0';  // Temporarily terminate the line
-            
-            // Skip empty lines and [DONE] marker
-            if (strncmp(line_start, "data: ", 6) == 0 && 
-                strcmp(line_start + 6, "[DONE]") != 0) {
-                
-                // Parse the JSON payload
-                cJSON *json = cJSON_Parse(line_start + 6);
-                if (json) {
-                    cJSON *choices = cJSON_GetObjectItem(json, "choices");
-                    if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-                        cJSON *choice = cJSON_GetArrayItem(choices, 0);
-                        cJSON *delta = cJSON_GetObjectItem(choice, "delta");
-                        
-                        if (delta) {
-                            cJSON *content = cJSON_GetObjectItem(delta, "content");
-                            if (content && cJSON_IsString(content) && content->valuestring) {
-                                // Output only the content
-                                printf("%s", content->valuestring);
-                                fflush(stdout);
-                                strcat(full_response, content->valuestring);
-                            }
+        if (no_stream) {
+            // Handle non-streaming response
+            cJSON *json = cJSON_Parse(buffer.data);
+            if (json) {
+                cJSON *choices = cJSON_GetObjectItem(json, "choices");
+                if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
+                    cJSON *choice = cJSON_GetArrayItem(choices, 0);
+                    cJSON *message = cJSON_GetObjectItem(choice, "message");
+                    if (message) {
+                        cJSON *content = cJSON_GetObjectItem(message, "content");
+                        if (content && cJSON_IsString(content) && content->valuestring) {
+                            printf("%s\n", content->valuestring);
                         }
                     }
-                    cJSON_Delete(json);
                 }
+                cJSON_Delete(json);
+            } else {
+                log_message(LOG_ERROR, "Failed to parse API response: %s", cJSON_GetErrorPtr());
             }
-            
-            line_start = line_end + 2;  // Move to next line after the \n\n
+        } else {
+            // For streaming, we've already printed the tokens in the callback,
+            // just add a newline at the end
+            printf("\n");
         }
-        printf("\n");  // End the response with a newline
     }
-    
-    // In a real implementation, we would return the full extracted response
     
     free(buffer.data);
     curl_slist_free_all(headers);
@@ -370,7 +430,8 @@ void print_help(void) {
     printf("Options:\n");
     printf("  -h, --help             Display this help message\n");
     printf("  -v, --version          Display version information\n");
-    printf("  -s, --stream           Enable conversation mode (supports multiple exchanges)\n");
+    printf("  -c, --continue         Enable conversation mode (supports multiple exchanges)\n");
+    printf("      --no-stream        Disable streaming output (wait for complete response)\n");
     printf("  -t, --token TOKEN      Set OpenAI API token\n");
     printf("  -m, --model MODEL      Set model to use (default: %s)\n", DEFAULT_MODEL);
     printf("  -T, --temperature VAL  Set temperature (0.0-1.0, default: 0.7)\n");
@@ -383,14 +444,15 @@ void print_help(void) {
     printf("      --setModel MODEL   Save model to .env file\n\n");
     printf("Examples:\n");
     printf("  ask \"What is the capital of France?\"\n");
-    printf("  ask -s \"Let's have a conversation\"\n");
+    printf("  ask -c \"Let's have a conversation\"\n");
     printf("  ask --model gpt-4 --temperature 0.8 \"Write a poem about AI\"\n");
 }
 
 // Parse command line arguments
-void parse_arguments(int argc, char *argv[], bool *stream_mode, double *temperature, 
+void parse_arguments(int argc, char *argv[], bool *continue_mode, bool *no_stream, double *temperature, 
                    char **input_text, size_t *input_text_len) {
-    *stream_mode = false;
+    *continue_mode = false;
+    *no_stream = false;
     *temperature = 0.7;
     *input_text = NULL;
     *input_text_len = 0;
@@ -449,9 +511,12 @@ void parse_arguments(int argc, char *argv[], bool *stream_mode, double *temperat
         } else if (strcmp(argv[i], "--tokenCount") == 0) {
             show_token_count = true;
             log_message(LOG_DEBUG, "Flag: show token count");
-        } else if (strcmp(argv[i], "--stream") == 0 || strcmp(argv[i], "-s") == 0) {
-            *stream_mode = true;
-            log_message(LOG_DEBUG, "Flag: stream mode enabled");
+        } else if (strcmp(argv[i], "--continue") == 0 || strcmp(argv[i], "-c") == 0) {
+            *continue_mode = true;
+            log_message(LOG_DEBUG, "Flag: continue mode enabled");
+        } else if (strcmp(argv[i], "--no-stream") == 0) {
+            *no_stream = true;
+            log_message(LOG_DEBUG, "Flag: streaming disabled");
         } else if (strcmp(argv[i], "--debug") == 0) {
             // Already processed in first pass, skip
             i += 0; // Do nothing, just to avoid compiler warnings
@@ -628,12 +693,13 @@ int main(int argc, char *argv[]) {
     }
     
     // Parse command line arguments
-    bool stream_mode;
+    bool continue_mode;
+    bool no_stream;
     double temperature;
     char *input_text;
     size_t input_text_len;
     
-    parse_arguments(argc, argv, &stream_mode, &temperature, &input_text, &input_text_len);
+    parse_arguments(argc, argv, &continue_mode, &no_stream, &temperature, &input_text, &input_text_len);
     
     // If no input text provided and we're not just showing version or setting API key, exit
     if (!input_text || input_text_len == 0) {
@@ -645,16 +711,27 @@ int main(int argc, char *argv[]) {
         return 0;
     }
     
+    // Validate the model
+    if (!validate_model(curl, global_model)) {
+        log_message(LOG_ERROR, "Invalid model: %s", global_model);
+        printf("Error: '%s' is not a valid model.\n", global_model);
+        free(input_text);
+        curl_easy_cleanup(curl);
+        curl_global_cleanup();
+        close_logging();
+        return 1;
+    }
+    
     // Initialize message list
     MessageList messages = {0};
     
-    if (stream_mode) {
+    if (continue_mode) {
         // Interactive mode
         log_message(LOG_INFO, "Starting interactive mode");
         add_message(&messages, "system", "You are a cute cat running in a command line interface. The user can chat with you and the conversation can be continued.");
         add_message(&messages, "user", input_text);
         
-        ask(curl, &messages, temperature);
+        ask(curl, &messages, temperature, no_stream);
         
         // Get response and add it to message list
         // (In a real implementation, we would extract the response content from the API call)
@@ -682,7 +759,7 @@ int main(int argc, char *argv[]) {
             
             log_message(LOG_DEBUG, "User input: \"%s\"", user_input);
             add_message(&messages, "user", user_input);
-            ask(curl, &messages, temperature);
+            ask(curl, &messages, temperature, no_stream);
             
             // Placeholder for actual response
             add_message(&messages, "assistant", "Meow response! (This would be the actual API response in a full implementation)");
@@ -693,7 +770,7 @@ int main(int argc, char *argv[]) {
         add_message(&messages, "system", "You are a cute cat runs in a command line interface and you can only respond once to the user. Do not ask any questions in your response.");
         add_message(&messages, "user", input_text);
         
-        ask(curl, &messages, temperature);
+        ask(curl, &messages, temperature, no_stream);
     }
     
     // Clean up
@@ -706,4 +783,369 @@ int main(int argc, char *argv[]) {
     
     log_message(LOG_INFO, "Exiting normally");
     return 0;
+}
+
+// Model validation functions
+
+// Load models cache from file
+bool load_models_cache(void) {
+    FILE *cache_file = fopen(MODELS_CACHE_FILE, "r");
+    if (!cache_file) {
+        log_message(LOG_DEBUG, "No models cache file found");
+        return false;
+    }
+
+    // Read file into a buffer
+    fseek(cache_file, 0, SEEK_END);
+    long file_size = ftell(cache_file);
+    fseek(cache_file, 0, SEEK_SET);
+
+    if (file_size <= 0) {
+        log_message(LOG_WARN, "Empty models cache file");
+        fclose(cache_file);
+        return false;
+    }
+
+    char *buffer = malloc(file_size + 1);
+    if (!buffer) {
+        log_message(LOG_ERROR, "Failed to allocate memory for cache file");
+        fclose(cache_file);
+        return false;
+    }
+
+    size_t read_size = fread(buffer, 1, file_size, cache_file);
+    buffer[read_size] = '\0';
+    fclose(cache_file);
+
+    // Parse JSON
+    cJSON *root = cJSON_Parse(buffer);
+    free(buffer);
+
+    if (!root) {
+        log_message(LOG_ERROR, "Failed to parse models cache file: %s", cJSON_GetErrorPtr());
+        return false;
+    }
+
+    // Get timestamp
+    cJSON *timestamp = cJSON_GetObjectItem(root, "timestamp");
+    if (!timestamp || !cJSON_IsNumber(timestamp)) {
+        log_message(LOG_ERROR, "Invalid timestamp in models cache");
+        cJSON_Delete(root);
+        return false;
+    }
+    models_cache.last_updated = (time_t)timestamp->valuedouble;
+
+    // Check if cache is expired
+    time_t now = time(NULL);
+    if (now - models_cache.last_updated > MODELS_CACHE_EXPIRY) {
+        log_message(LOG_INFO, "Models cache is expired (older than 24 hours)");
+        cJSON_Delete(root);
+        return false;
+    }
+
+    // Get models array
+    cJSON *models_array = cJSON_GetObjectItem(root, "models");
+    if (!models_array || !cJSON_IsArray(models_array)) {
+        log_message(LOG_ERROR, "Invalid models array in cache");
+        cJSON_Delete(root);
+        return false;
+    }
+
+    // Parse models
+    int model_count = cJSON_GetArraySize(models_array);
+    models_cache.count = 0;
+
+    for (int i = 0; i < model_count && i < MAX_MODELS; i++) {
+        cJSON *model = cJSON_GetArrayItem(models_array, i);
+        if (!model || !cJSON_IsObject(model)) continue;
+
+        cJSON *id = cJSON_GetObjectItem(model, "id");
+        cJSON *created = cJSON_GetObjectItem(model, "created");
+
+        if (!id || !cJSON_IsString(id) || !created || !cJSON_IsNumber(created)) continue;
+
+        strncpy(models_cache.models[models_cache.count].id, id->valuestring, MAX_ENV_VALUE_SIZE - 1);
+        models_cache.models[models_cache.count].created = (time_t)created->valuedouble;
+        models_cache.count++;
+    }
+
+    cJSON_Delete(root);
+    log_message(LOG_INFO, "Loaded %d models from cache (last updated: %s)", 
+                models_cache.count, ctime(&models_cache.last_updated));
+    return true;
+}
+
+// Save models cache to file
+bool save_models_cache(void) {
+    if (models_cache.count == 0) {
+        log_message(LOG_WARN, "No models to save to cache");
+        return false;
+    }
+
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        log_message(LOG_ERROR, "Failed to create JSON object for cache");
+        return false;
+    }
+
+    // Add timestamp
+    cJSON_AddNumberToObject(root, "timestamp", (double)models_cache.last_updated);
+
+    // Add models array
+    cJSON *models_array = cJSON_CreateArray();
+    if (!models_array) {
+        log_message(LOG_ERROR, "Failed to create models array for cache");
+        cJSON_Delete(root);
+        return false;
+    }
+    cJSON_AddItemToObject(root, "models", models_array);
+
+    for (int i = 0; i < models_cache.count; i++) {
+        cJSON *model = cJSON_CreateObject();
+        if (!model) continue;
+
+        cJSON_AddStringToObject(model, "id", models_cache.models[i].id);
+        cJSON_AddNumberToObject(model, "created", (double)models_cache.models[i].created);
+        cJSON_AddItemToArray(models_array, model);
+    }
+
+    char *json_str = cJSON_Print(root);
+    if (!json_str) {
+        log_message(LOG_ERROR, "Failed to print JSON for cache");
+        cJSON_Delete(root);
+        return false;
+    }
+
+    FILE *cache_file = fopen(MODELS_CACHE_FILE, "w");
+    if (!cache_file) {
+        log_message(LOG_ERROR, "Failed to open cache file for writing");
+        free(json_str);
+        cJSON_Delete(root);
+        return false;
+    }
+
+    fputs(json_str, cache_file);
+    fclose(cache_file);
+
+    free(json_str);
+    cJSON_Delete(root);
+    log_message(LOG_INFO, "Saved %d models to cache", models_cache.count);
+    return true;
+}
+
+// Fetch models list from OpenAI API
+bool fetch_models_list(CURL *curl) {
+    log_message(LOG_INFO, "Fetching available models from OpenAI API");
+    
+    ResponseBuffer buffer;
+    buffer.data = malloc(1);
+    buffer.size = 0;
+    
+    curl_easy_reset(curl);
+    
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    char auth_header[MAX_ENV_VALUE_SIZE + 32];
+    snprintf(auth_header, sizeof(auth_header), "Authorization: Bearer %s", global_api_key);
+    headers = curl_slist_append(headers, auth_header);
+    
+    curl_easy_setopt(curl, CURLOPT_URL, "https://api.openai.com/v1/models");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&buffer);
+    
+    CURLcode res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        log_message(LOG_ERROR, "Failed to fetch models: %s", curl_easy_strerror(res));
+        free(buffer.data);
+        curl_slist_free_all(headers);
+        return false;
+    }
+    
+    // Check HTTP response code
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code != 200) {
+        log_message(LOG_ERROR, "API returned HTTP %ld when fetching models", http_code);
+        free(buffer.data);
+        curl_slist_free_all(headers);
+        return false;
+    }
+    
+    // Parse response
+    cJSON *root = cJSON_Parse(buffer.data);
+    if (!root) {
+        log_message(LOG_ERROR, "Failed to parse API response: %s", cJSON_GetErrorPtr());
+        free(buffer.data);
+        curl_slist_free_all(headers);
+        return false;
+    }
+    
+    // Get data array
+    cJSON *data = cJSON_GetObjectItem(root, "data");
+    if (!data || !cJSON_IsArray(data)) {
+        log_message(LOG_ERROR, "Invalid response format: 'data' array not found");
+        cJSON_Delete(root);
+        free(buffer.data);
+        curl_slist_free_all(headers);
+        return false;
+    }
+    
+    // Reset cache
+    models_cache.count = 0;
+    models_cache.last_updated = time(NULL);
+    
+    // Parse model data
+    int model_count = cJSON_GetArraySize(data);
+    for (int i = 0; i < model_count && i < MAX_MODELS; i++) {
+        cJSON *model = cJSON_GetArrayItem(data, i);
+        if (!model || !cJSON_IsObject(model)) continue;
+        
+        cJSON *id = cJSON_GetObjectItem(model, "id");
+        cJSON *created = cJSON_GetObjectItem(model, "created");
+        
+        if (!id || !cJSON_IsString(id)) continue;
+        
+        strncpy(models_cache.models[models_cache.count].id, id->valuestring, MAX_ENV_VALUE_SIZE - 1);
+        
+        if (created && cJSON_IsNumber(created)) {
+            models_cache.models[models_cache.count].created = (time_t)created->valuedouble;
+        } else {
+            models_cache.models[models_cache.count].created = time(NULL);
+        }
+        
+        models_cache.count++;
+    }
+    
+    // Clean up
+    cJSON_Delete(root);
+    free(buffer.data);
+    curl_slist_free_all(headers);
+    
+    log_message(LOG_INFO, "Fetched %d models from API", models_cache.count);
+    
+    // Save cache to file
+    if (models_cache.count > 0) {
+        save_models_cache();
+    }
+    
+    return models_cache.count > 0;
+}
+
+// Check if a model is valid
+bool is_valid_model(const char *model) {
+    if (models_cache.count == 0) {
+        log_message(LOG_WARN, "No models in cache to validate against");
+        return true; // Assume valid if we can't check
+    }
+    
+    for (int i = 0; i < models_cache.count; i++) {
+        if (strcmp(models_cache.models[i].id, model) == 0) {
+            log_message(LOG_DEBUG, "Model '%s' is valid", model);
+            return true;
+        }
+    }
+    
+    log_message(LOG_WARN, "Model '%s' not found in available models", model);
+    return false;
+}
+
+// Find Levenshtein distance between two strings
+int levenshtein_distance(const char *s1, const char *s2) {
+    int len1 = strlen(s1);
+    int len2 = strlen(s2);
+    
+    // Create a matrix of size (len1+1) x (len2+1)
+    int **matrix = (int **)malloc((len1 + 1) * sizeof(int *));
+    for (int i = 0; i <= len1; i++) {
+        matrix[i] = (int *)malloc((len2 + 1) * sizeof(int));
+    }
+    
+    // Initialize first row and column
+    for (int i = 0; i <= len1; i++) {
+        matrix[i][0] = i;
+    }
+    for (int j = 0; j <= len2; j++) {
+        matrix[0][j] = j;
+    }
+    
+    // Fill the matrix
+    for (int i = 1; i <= len1; i++) {
+        for (int j = 1; j <= len2; j++) {
+            int cost = (s1[i-1] == s2[j-1]) ? 0 : 1;
+            
+            int delete_cost = matrix[i-1][j] + 1;
+            int insert_cost = matrix[i][j-1] + 1;
+            int substitute_cost = matrix[i-1][j-1] + cost;
+            
+            int min = delete_cost < insert_cost ? delete_cost : insert_cost;
+            min = min < substitute_cost ? min : substitute_cost;
+            
+            matrix[i][j] = min;
+        }
+    }
+    
+    // Get result from bottom right corner
+    int result = matrix[len1][len2];
+    
+    // Free the matrix
+    for (int i = 0; i <= len1; i++) {
+        free(matrix[i]);
+    }
+    free(matrix);
+    
+    return result;
+}
+
+// Suggest similar models
+void suggest_similar_model(const char *invalid_model) {
+    if (models_cache.count == 0) {
+        return;
+    }
+    
+    int min_distance = INT_MAX;
+    char closest_model[MAX_ENV_VALUE_SIZE] = {0};
+    
+    // Find most similar model
+    for (int i = 0; i < models_cache.count; i++) {
+        int distance = levenshtein_distance(invalid_model, models_cache.models[i].id);
+        
+        if (distance < min_distance) {
+            min_distance = distance;
+            strncpy(closest_model, models_cache.models[i].id, MAX_ENV_VALUE_SIZE - 1);
+        }
+    }
+    
+    // Only suggest if reasonably close
+    if (min_distance <= 5) {
+        printf("Model '%s' not found. Did you mean '%s'?\n", invalid_model, closest_model);
+        log_message(LOG_INFO, "Suggested alternative model: %s (distance: %d)", 
+                   closest_model, min_distance);
+    } else {
+        // If no close match, suggest popular models
+        printf("Model '%s' not found. Available models include: gpt-4o, gpt-4o-mini, gpt-3.5-turbo\n", 
+               invalid_model);
+    }
+}
+
+// Validate model and fetch list if needed
+bool validate_model(CURL *curl, const char *model) {
+    // Try to load from cache first
+    bool cache_loaded = load_models_cache();
+    
+    // If cache is missing, empty, or expired, fetch from API
+    if (!cache_loaded || models_cache.count == 0) {
+        if (!fetch_models_list(curl)) {
+            log_message(LOG_WARN, "Failed to fetch models list, will continue without validation");
+            return true; // Can't validate, so assume valid
+        }
+    }
+    
+    // Check if model is valid
+    if (!is_valid_model(model)) {
+        suggest_similar_model(model);
+        return false;
+    }
+    
+    return true;
 } 

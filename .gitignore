@@ -37,3 +37,4 @@ ask
 *.swp
 *.swo
 .DS_Store 
+.models_cache.json
