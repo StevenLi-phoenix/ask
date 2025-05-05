@@ -4,7 +4,9 @@ It is designed to be used in terminal for quick and easy access to information.
 The backend is powered by OpenAI's GPT-4, which is a powerful language model that can answer a wide range of questions.
 That means you need to provide an API key to use this tool.
 
-## Installation
+## Python Implementation
+
+### Installation
 You can install "ask" using pip:
 ```bash
 pip install -r requirements.txt
@@ -61,53 +63,89 @@ for more information, you can use the --help option:
 ask --help
 ```
 
-```text
-usage: main.py [-h] [--token TOKEN] [--model MODEL] [--version] [--tokenCount]
-               [--stream] [--temperture TEMPERTURE] [--tokenLimit TOKENLIMIT]
-               [string ...]
+# C Implementation
 
-OpenAI Chatbot
+A C version of the program is also available.
 
-positional arguments:
-  string                Questions
+## Requirements
 
-options:
-  -h, --help            show this help message and exit
-  --token TOKEN, -t TOKEN
-                        Set the token for the chatbot
-  --model MODEL, -m MODEL
-                        Set the model for the chatbot
-  --version, -v         Show the version of the chatbot
-  --tokenCount          Set the token for the chatbot
-  --stream, -s          Don't close chat completion and wait for more input
-  --temperture TEMPERTURE, -T TEMPERTURE
-                        Set the temperture for the chatbot
-  --tokenLimit TOKENLIMIT, -l TOKENLIMIT
-                        Set the token limit for the chatbot
-```
+- GCC or compatible C compiler
+- libcurl development libraries
+- cJSON library
 
-# Note
-The ANY_THING is the question you want to ask the chatbot and should not using period or question mark at the end of the question.
+On macOS, you can install the required libraries with:
+
 ```bash
-ask What is the capital of France
-```
-```text
-The capital of France is Paris.
-```
-If you want to use the symbol, you have to pass the question in the double quote.
-```bash
-ask "What is the capital of France?"
-```
-```text
-The capital of France is Paris.
+brew install curl cjson
 ```
 
-The ask command will not render the question for markdown, so the display is plain text.
-if you want to use the markdown, you will have to do it manually.
+On Ubuntu/Debian:
+
 ```bash
-ask "What is the capital of France?" > README.md
-open README.md
+sudo apt-get install libcurl4-openssl-dev libcjson-dev
 ```
+
+## Building
+
+To build the C version, simply run:
+
+```bash
+make
+```
+
+This will produce an executable called `ask`.
+
+## Setup
+
+The C version uses the same configuration as the Python version. You can set your OpenAI API key in several ways:
+
+1. Create a `.env` file with the following content:
+   ```
+   OPENAI_API_KEY=your_api_key_here
+   ASK_GLOBAL_MODEL=gpt-4o-mini
+   ```
+
+2. Set environment variables:
+   ```bash
+   export OPENAI_API_KEY=your_api_key_here
+   export ASK_GLOBAL_MODEL=gpt-4o-mini
+   ```
+
+3. Use command-line options to set them:
+   ```bash
+   ./ask --setAPIKey your_api_key_here --setModel gpt-4o-mini
+   ```
+
+## Usage
+
+The C version supports the same command-line options as the Python version:
+
+```bash
+./ask What is the capital of France?
+```
+
+### Interactive Mode
+
+```bash
+./ask -s Tell me a story
+```
+
+In interactive mode, type "exit" to quit.
+
+### Other Options
+
+- `--version` or `-v`: Show version information
+- `--tokenCount`: Display approximate token count for your message
+- `--temperature` or `-T`: Set temperature (default: 0.7)
+- `--tokenLimit` or `-l`: Set maximum token limit (default: 128000)
+- `--token` or `-t`: Set API token for just this session
+- `--model` or `-m`: Set model for just this session
+- `--debug`: Show debug information
+
+## Notes
+
+- Token counting in the C version is approximate and not as accurate as tiktoken in Python
+- The C version uses libcurl for HTTP requests and cJSON for JSON parsing
 
 # Contributing
 Any
