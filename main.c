@@ -9,6 +9,7 @@
 #include <stdarg.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <pwd.h>
 
 #define DEFAULT_MODEL "gpt-4o-mini"
 #define MAX_ENV_VALUE_SIZE 1024
@@ -16,7 +17,7 @@
 #define DEFAULT_TOKEN_LIMIT 128000
 #define MAX_MESSAGES 100
 #define MAX_MODELS 200
-#define MODELS_CACHE_FILE ".models_cache.json"
+#define MODELS_CACHE_FILE "~/.ask_models_cache.json"
 #define MODELS_CACHE_EXPIRY 86400 // 24 hours in seconds
 
 // Log levels
@@ -87,6 +88,7 @@ bool save_models_cache(void);
 bool fetch_models_list(CURL *curl);
 bool is_valid_model(const char *model);
 void suggest_similar_model(const char *invalid_model);
+char* expand_home_path(const char *path);
 
 // Initialize logging
 void init_logging(void) {
@@ -790,9 +792,60 @@ int main(int argc, char *argv[]) {
 
 // Model validation functions
 
+// Function to expand the tilde in a path
+char* expand_home_path(const char *path) {
+    if (path[0] != '~') {
+        return strdup(path);
+    }
+    
+    struct passwd *pw = getpwuid(getuid());
+    if (pw == NULL) {
+        // If we can't get the home directory, just return the original path
+        log_message(LOG_ERROR, "Could not determine home directory");
+        return strdup(path);
+    }
+    
+    size_t home_len = strlen(pw->pw_dir);
+    size_t path_len = strlen(path);
+    char *expanded_path = malloc(home_len + path_len);
+    
+    if (expanded_path == NULL) {
+        log_message(LOG_ERROR, "Memory allocation failed for path expansion");
+        return strdup(path);
+    }
+    
+    strcpy(expanded_path, pw->pw_dir);
+    strcat(expanded_path, path + 1); // Skip the tilde
+    
+    // Check if directory exists
+    char *last_slash = strrchr(expanded_path, '/');
+    if (last_slash != NULL) {
+        // Temporarily cut the string at the last slash to get just the directory part
+        *last_slash = '\0';
+        
+        // Check if directory exists, create if needed
+        struct stat st = {0};
+        if (stat(expanded_path, &st) == -1) {
+            log_message(LOG_INFO, "Creating directory: %s", expanded_path);
+            if (mkdir(expanded_path, 0700) == -1) {
+                log_message(LOG_ERROR, "Failed to create directory: %s", expanded_path);
+            }
+        }
+        
+        // Restore the full path
+        *last_slash = '/';
+    }
+    
+    log_message(LOG_DEBUG, "Expanded path: %s", expanded_path);
+    return expanded_path;
+}
+
 // Load models cache from file
 bool load_models_cache(void) {
-    FILE *cache_file = fopen(MODELS_CACHE_FILE, "r");
+    char *expanded_path = expand_home_path(MODELS_CACHE_FILE);
+    FILE *cache_file = fopen(expanded_path, "r");
+    free(expanded_path);
+    
     if (!cache_file) {
         log_message(LOG_DEBUG, "No models cache file found");
         return false;
@@ -919,7 +972,10 @@ bool save_models_cache(void) {
         return false;
     }
 
-    FILE *cache_file = fopen(MODELS_CACHE_FILE, "w");
+    char *expanded_path = expand_home_path(MODELS_CACHE_FILE);
+    FILE *cache_file = fopen(expanded_path, "w");
+    free(expanded_path);
+    
     if (!cache_file) {
         log_message(LOG_ERROR, "Failed to open cache file for writing");
         free(json_str);
