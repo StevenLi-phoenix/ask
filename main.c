@@ -703,14 +703,23 @@ int main(int argc, char *argv[]) {
     
     parse_arguments(argc, argv, &continue_mode, &no_stream, &temperature, &input_text, &input_text_len);
     
-    // If no input text provided and we're not just showing version or setting API key, exit
+    // If no input text provided, handle differently based on mode
     if (!input_text || input_text_len == 0) {
-        log_message(LOG_INFO, "No input text provided, exiting");
-        free(input_text);
-        curl_easy_cleanup(curl);
-        curl_global_cleanup();
-        close_logging();
-        return 0;
+        if (continue_mode) {
+            log_message(LOG_INFO, "No input text provided, starting conversation mode anyway");
+            // We'll handle empty input in conversation mode later
+        } else {
+            log_message(LOG_INFO, "No input text provided, showing usage hint");
+            printf("No input provided. Usage examples:\n");
+            printf("  ask \"What is the capital of France?\"\n");
+            printf("  ask -c \"Let's have a conversation\"\n");
+            printf("  ask --help\n");
+            free(input_text);
+            curl_easy_cleanup(curl);
+            curl_global_cleanup();
+            close_logging();
+            return 0;
+        }
     }
     
     // Validate the model
@@ -731,15 +740,20 @@ int main(int argc, char *argv[]) {
         // Interactive mode
         log_message(LOG_INFO, "Starting interactive mode");
         add_message(&messages, "system", "You are a cute cat running in a command line interface. The user can chat with you and the conversation can be continued.");
-        add_message(&messages, "user", input_text);
         
-        ask(curl, &messages, temperature, no_stream);
+        // Only send initial message if we have input text
+        if (input_text && input_text_len > 0) {
+            add_message(&messages, "user", input_text);
+            ask(curl, &messages, temperature, no_stream);
+            
+            // Get response and add it to message list
+            // (In a real implementation, we would extract the response content from the API call)
+            add_message(&messages, "assistant", "I'm a cute cat meow! (Note: In a full implementation, this would be the actual API response)");
+        } else {
+            printf("Starting conversation mode...\n");
+        }
         
-        // Get response and add it to message list
-        // (In a real implementation, we would extract the response content from the API call)
-        add_message(&messages, "assistant", "I'm a cute cat meow! (Note: In a full implementation, this would be the actual API response)");
-        
-        printf("Type 'exit' to quit.\n");
+        printf("Type 'exit' to quit, 'status' for conversation info, or 'help' for commands.\n");
         
         char user_input[MAX_BUFFER_SIZE];
         while (true) {
@@ -760,6 +774,24 @@ int main(int argc, char *argv[]) {
             if (strcmp(user_input, "exit") == 0) {
                 log_message(LOG_INFO, "User requested exit");
                 break;
+            } else if (strcmp(user_input, "status") == 0) {
+                // Show conversation status
+                int approx_tokens = count_tokens_from_messages(&messages, global_model);
+                printf("Conversation Status:\n");
+                printf("  Messages: %d\n", messages.count);
+                printf("  Approximate tokens: %d / %d\n", approx_tokens, token_limit);
+                printf("  Model: %s\n", global_model);
+                printf("  Temperature: %.2f\n", temperature);
+                printf("  Streaming: %s\n", no_stream ? "disabled" : "enabled");
+                continue;
+            } else if (strcmp(user_input, "help") == 0) {
+                // Show conversation mode help
+                printf("Conversation Mode Commands:\n");
+                printf("  exit    - Exit conversation mode\n");
+                printf("  status  - Show conversation information\n");
+                printf("  help    - Show this help message\n");
+                printf("  Any other text will be sent to the AI assistant.\n");
+                continue;
             }
             
             log_message(LOG_DEBUG, "User input: \"%s\"", user_input);
