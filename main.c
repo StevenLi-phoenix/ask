@@ -89,6 +89,9 @@ bool fetch_models_list(CURL *curl);
 bool is_valid_model(const char *model);
 void suggest_similar_model(const char *invalid_model);
 char* expand_home_path(const char *path);
+bool is_plain_text_file(const char *filename);
+char* read_file_content(const char *filename);
+char* process_file_references(const char *input);
 
 // Initialize logging
 void init_logging(void) {
@@ -743,7 +746,14 @@ int main(int argc, char *argv[]) {
         
         // Only send initial message if we have input text
         if (input_text && input_text_len > 0) {
-            add_message(&messages, "user", input_text);
+            // Process file references in input
+            char *processed_input = process_file_references(input_text);
+            if (processed_input) {
+                add_message(&messages, "user", processed_input);
+                free(processed_input);
+            } else {
+                add_message(&messages, "user", input_text);
+            }
             ask(curl, &messages, temperature, no_stream);
             
             // Get response and add it to message list
@@ -795,7 +805,14 @@ int main(int argc, char *argv[]) {
             }
             
             log_message(LOG_DEBUG, "User input: \"%s\"", user_input);
-            add_message(&messages, "user", user_input);
+            // Process file references in user input
+            char *processed_input = process_file_references(user_input);
+            if (processed_input) {
+                add_message(&messages, "user", processed_input);
+                free(processed_input);
+            } else {
+                add_message(&messages, "user", user_input);
+            }
             ask(curl, &messages, temperature, no_stream);
             
             // Placeholder for actual response
@@ -805,7 +822,15 @@ int main(int argc, char *argv[]) {
         // Single response mode
         log_message(LOG_INFO, "Single response mode");
         add_message(&messages, "system", "You are a cute cat runs in a command line interface and you can only respond once to the user. Do not ask any questions in your response.");
-        add_message(&messages, "user", input_text);
+        
+        // Process file references in input
+        char *processed_input = process_file_references(input_text);
+        if (processed_input) {
+            add_message(&messages, "user", processed_input);
+            free(processed_input);
+        } else {
+            add_message(&messages, "user", input_text);
+        }
         
         ask(curl, &messages, temperature, no_stream);
     }
@@ -820,6 +845,239 @@ int main(int argc, char *argv[]) {
     
     log_message(LOG_INFO, "Exiting normally");
     return 0;
+}
+
+// File attachment functions
+
+// Check if a file is likely plain text
+bool is_plain_text_file(const char *filename) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) {
+        log_message(LOG_WARN, "Cannot open file: %s", filename);
+        return false;
+    }
+    
+    // Check first 1024 bytes for binary content
+    unsigned char buffer[1024];
+    size_t bytes_read = fread(buffer, 1, sizeof(buffer), file);
+    fclose(file);
+    
+    if (bytes_read == 0) {
+        return true; // Empty file is considered text
+    }
+    
+    // Count null bytes and control characters
+    int null_count = 0;
+    int control_count = 0;
+    
+    for (size_t i = 0; i < bytes_read; i++) {
+        if (buffer[i] == 0) {
+            null_count++;
+        } else if (buffer[i] < 32 && buffer[i] != '\n' && buffer[i] != '\r' && buffer[i] != '\t') {
+            control_count++;
+        }
+    }
+    
+    // File is likely binary if it has null bytes or too many control chars
+    if (null_count > 0 || control_count > bytes_read / 20) {
+        return false;
+    }
+    
+    return true;
+}
+
+// Read entire file content into a string
+char* read_file_content(const char *filename) {
+    FILE *file = fopen(filename, "r");
+    if (!file) {
+        log_message(LOG_ERROR, "Failed to open file: %s", filename);
+        return NULL;
+    }
+    
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    if (file_size <= 0) {
+        fclose(file);
+        return strdup(""); // Empty file
+    }
+    
+    // Limit file size to prevent memory issues
+    if (file_size > 10000) { // 10KB limit
+        fclose(file);
+        log_message(LOG_WARN, "File too large (>10KB): %s", filename);
+        return NULL;
+    }
+    
+    char *content = malloc(file_size + 1);
+    if (!content) {
+        fclose(file);
+        log_message(LOG_ERROR, "Memory allocation failed for file: %s", filename);
+        return NULL;
+    }
+    
+    size_t bytes_read = fread(content, 1, file_size, file);
+    content[bytes_read] = '\0';
+    fclose(file);
+    
+    log_message(LOG_DEBUG, "Read %zu bytes from file: %s", bytes_read, filename);
+    return content;
+}
+
+// Process input text and replace @filename with file content
+char* process_file_references(const char *input) {
+    if (!input || strlen(input) == 0) {
+        return NULL;
+    }
+    
+    // Create a copy of input to work with
+    char *result = strdup(input);
+    if (!result) {
+        log_message(LOG_ERROR, "Memory allocation failed for input processing");
+        return NULL;
+    }
+    
+    char *at_pos = strchr(result, '@');
+    
+    while (at_pos != NULL) {
+        // Find the end of the filename - support quoted paths and unquoted paths
+        char *filename_start = at_pos + 1;
+        char *filename_end = filename_start;
+        bool quoted = false;
+        
+        // Check if path is quoted
+        if (*filename_start == '"' || *filename_start == '\'') {
+            quoted = true;
+            char quote_char = *filename_start;
+            filename_start++; // Skip opening quote
+            filename_end = filename_start;
+            
+            // Find closing quote
+            while (*filename_end && *filename_end != quote_char) {
+                filename_end++;
+            }
+            // filename_end now points to closing quote or end of string
+        } else {
+            // Unquoted path - stop at whitespace or sentence-ending punctuation
+            while (*filename_end) {
+                if (*filename_end == ' ' || *filename_end == '\t' || 
+                    *filename_end == '\n' || *filename_end == '\r') {
+                    break;  // Stop at whitespace
+                }
+                
+                // Stop at sentence-ending punctuation (but allow dots in filenames)
+                if ((*filename_end == '?' || *filename_end == '!' || *filename_end == ';') ||
+                    (*filename_end == '.' && (filename_end[1] == ' ' || filename_end[1] == '\0' || 
+                     filename_end[1] == '\n' || filename_end[1] == '\t'))) {
+                    break;  // Stop at sentence punctuation or end-of-sentence periods
+                }
+                
+                // Stop at common delimiters
+                if (*filename_end == ',' || *filename_end == ')' || *filename_end == '}') {
+                    break;
+                }
+                
+                filename_end++;
+            }
+        }
+        
+        if (filename_end > filename_start) {
+            // Extract filename
+            size_t filename_len = filename_end - filename_start;
+            char *filename = malloc(filename_len + 1);
+            if (!filename) {
+                log_message(LOG_ERROR, "Memory allocation failed for filename");
+                break;
+            }
+            
+            strncpy(filename, filename_start, filename_len);
+            filename[filename_len] = '\0';
+            
+            log_message(LOG_DEBUG, "Found file reference: %s", filename);
+            
+            // For suffix calculation, we need to account for closing quote
+            char *suffix_start = filename_end;
+            if (quoted && *filename_end) {
+                suffix_start++; // Skip closing quote
+            }
+            
+            // Check if file exists and is plain text
+            if (access(filename, F_OK) == 0 && is_plain_text_file(filename)) {
+                char *file_content = read_file_content(filename);
+                
+                if (file_content) {
+                    // Calculate new string size
+                    size_t prefix_len = at_pos - result;
+                    size_t suffix_len = strlen(suffix_start);
+                    size_t content_len = strlen(file_content);
+                    size_t new_size = prefix_len + content_len + suffix_len + 50; // Extra space for formatting
+                    
+                    char *new_result = malloc(new_size);
+                    if (new_result) {
+                        // Build new string: prefix + "File: filename\n" + content + suffix
+                        snprintf(new_result, new_size, "%.*s\nFile: %s\n```\n%s\n```%s", 
+                                (int)prefix_len, result, filename, file_content, suffix_start);
+                        
+                        free(result);
+                        result = new_result;
+                        // Update at_pos to point to where we should continue searching
+                        at_pos = result + prefix_len + strlen(filename) + content_len + 20; // Rough estimate
+                        
+                        log_message(LOG_INFO, "Attached file content: %s (%zu bytes)", filename, content_len);
+                    } else {
+                        log_message(LOG_ERROR, "Memory allocation failed for result string");
+                    }
+                    
+                    free(file_content);
+                } else {
+                    log_message(LOG_WARN, "Could not read file content: %s", filename);
+                    // Replace @filename with error message
+                    size_t prefix_len = at_pos - result;
+                    size_t suffix_len = strlen(suffix_start);
+                    size_t new_size = prefix_len + suffix_len + 100;
+                    
+                    char *new_result = malloc(new_size);
+                    if (new_result) {
+                        snprintf(new_result, new_size, "%.*s[Error: Could not read %s]%s", 
+                                (int)prefix_len, result, filename, suffix_start);
+                        free(result);
+                        result = new_result;
+                        // Update at_pos to continue searching
+                        at_pos = result + prefix_len + strlen(filename) + 30;
+                    }
+                }
+            } else {
+                log_message(LOG_WARN, "File not found or not plain text: %s", filename);
+                // Replace @filename with error message
+                size_t prefix_len = at_pos - result;
+                size_t suffix_len = strlen(suffix_start);
+                size_t new_size = prefix_len + suffix_len + 100;
+                
+                char *new_result = malloc(new_size);
+                if (new_result) {
+                    snprintf(new_result, new_size, "%.*s[File not found: %s]%s", 
+                            (int)prefix_len, result, filename, suffix_start);
+                    free(result);
+                    result = new_result;
+                    // Update at_pos to continue searching
+                    at_pos = result + prefix_len + strlen(filename) + 20;
+                }
+            }
+            
+            free(filename);
+        }
+        
+        // Look for next @ symbol (at_pos was already updated above, so just search from there)
+        if (at_pos < result + strlen(result)) {
+            at_pos = strchr(at_pos, '@');
+        } else {
+            at_pos = NULL;
+        }
+    }
+    
+    return result;
 }
 
 // Model validation functions
