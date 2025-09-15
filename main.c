@@ -11,7 +11,7 @@
 #include <limits.h>
 #include <pwd.h>
 
-#define DEFAULT_MODEL "gpt-4o-mini"
+#define DEFAULT_MODEL "gpt-5-nano"
 #define MAX_ENV_VALUE_SIZE 1024
 #define MAX_BUFFER_SIZE 8192
 #define DEFAULT_TOKEN_LIMIT 128000
@@ -33,6 +33,7 @@ typedef struct {
     char *data;
     size_t size;
     bool stream_enabled;
+    bool saw_stream_data;
 } ResponseBuffer;
 
 typedef struct {
@@ -237,6 +238,7 @@ size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
                                 // Output the content as it arrives
                                 printf("%s", content->valuestring);
                                 fflush(stdout);  // Force flush to show progress
+                                mem->saw_stream_data = true;
                             }
                         }
                     }
@@ -263,6 +265,7 @@ size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
 // Approximate token counting function
 // In a real implementation, this would need to use a proper tokenizer like tiktoken
 int count_tokens_from_messages(MessageList *messages, const char *model) {
+    (void)model; // currently unused
     // This is a very crude approximation
     // In reality, you'd need to implement a tokenizer similar to tiktoken
     int tokens = 3; // Initial tokens
@@ -365,17 +368,23 @@ void ask(CURL *curl, MessageList *messages, double temperature, bool no_stream) 
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str);
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+    if (!no_stream) {
+        headers = curl_slist_append(headers, "Accept: text/event-stream");
+    }
     
     ResponseBuffer buffer;
     buffer.data = malloc(1);
     buffer.size = 0;
     buffer.stream_enabled = !no_stream;  // Set streaming flag based on mode
+    buffer.saw_stream_data = false;
     
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&buffer);
     
     // Perform the request
     log_message(LOG_INFO, "Sending request to API...");
     CURLcode res = curl_easy_perform(curl);
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
     
     if (res != CURLE_OK) {
         log_message(LOG_ERROR, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
@@ -383,7 +392,22 @@ void ask(CURL *curl, MessageList *messages, double temperature, bool no_stream) 
         log_message(LOG_INFO, "Request completed successfully");
         log_message(LOG_DEBUG, "Response size: %zu bytes", buffer.size);
         
-        if (no_stream) {
+        if (http_code >= 400) {
+            // Try to parse and display error details
+            cJSON *err = cJSON_Parse(buffer.data);
+            if (err) {
+                cJSON *error_obj = cJSON_GetObjectItem(err, "error");
+                cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : NULL;
+                if (msg && cJSON_IsString(msg) && msg->valuestring) {
+                    fprintf(stderr, "API error (HTTP %ld): %s\n", http_code, msg->valuestring);
+                } else {
+                    fprintf(stderr, "API error (HTTP %ld).\n", http_code);
+                }
+                cJSON_Delete(err);
+            } else {
+                fprintf(stderr, "API error (HTTP %ld).\n", http_code);
+            }
+        } else if (no_stream) {
             // Handle non-streaming response
             cJSON *json = cJSON_Parse(buffer.data);
             if (json) {
@@ -404,7 +428,32 @@ void ask(CURL *curl, MessageList *messages, double temperature, bool no_stream) 
             }
         } else {
             // For streaming, we've already printed the tokens in the callback,
-            // just add a newline at the end
+            // but if nothing was streamed, fall back to parsing full JSON
+            if (!buffer.saw_stream_data && buffer.size > 0) {
+                cJSON *json = cJSON_Parse(buffer.data);
+                if (json) {
+                    cJSON *choices = cJSON_GetObjectItem(json, "choices");
+                    if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
+                        cJSON *choice = cJSON_GetArrayItem(choices, 0);
+                        cJSON *message = cJSON_GetObjectItem(choice, "message");
+                        if (message) {
+                            cJSON *content = cJSON_GetObjectItem(message, "content");
+                            if (content && cJSON_IsString(content) && content->valuestring) {
+                                printf("%s\n", content->valuestring);
+                            }
+                        }
+                    } else {
+                        // If it's an error payload, surface it
+                        cJSON *error_obj = cJSON_GetObjectItem(json, "error");
+                        cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : NULL;
+                        if (msg && cJSON_IsString(msg) && msg->valuestring) {
+                            fprintf(stderr, "API error: %s\n", msg->valuestring);
+                        }
+                    }
+                    cJSON_Delete(json);
+                }
+            }
+            // Always ensure we end with a newline
             printf("\n");
         }
     }
@@ -439,7 +488,7 @@ void print_help(void) {
     printf("      --no-stream        Disable streaming output (wait for complete response)\n");
     printf("  -t, --token TOKEN      Set OpenAI API token\n");
     printf("  -m, --model MODEL      Set model to use (default: %s)\n", DEFAULT_MODEL);
-    printf("  -T, --temperature VAL  Set temperature (0.0-1.0, default: 0.7)\n");
+    printf("  -T, --temperature VAL  Set temperature (0.0-1.0, default: 1.0)\n");
     printf("  -l, --tokenLimit NUM   Set token limit (default: %d)\n", DEFAULT_TOKEN_LIMIT);
     printf("      --tokenCount       Count tokens in input text and exit\n");
     printf("      --debug            Enable debug mode\n");
@@ -458,7 +507,7 @@ void parse_arguments(int argc, char *argv[], bool *continue_mode, bool *no_strea
                    char **input_text, size_t *input_text_len) {
     *continue_mode = false;
     *no_stream = false;
-    *temperature = 0.7;
+    *temperature = 1.0;
     *input_text = NULL;
     *input_text_len = 0;
     
@@ -867,8 +916,8 @@ bool is_plain_text_file(const char *filename) {
     }
     
     // Count null bytes and control characters
-    int null_count = 0;
-    int control_count = 0;
+    size_t null_count = 0;
+    size_t control_count = 0;
     
     for (size_t i = 0; i < bytes_read; i++) {
         if (buffer[i] == 0) {
@@ -1289,6 +1338,8 @@ bool fetch_models_list(CURL *curl) {
     ResponseBuffer buffer;
     buffer.data = malloc(1);
     buffer.size = 0;
+    buffer.stream_enabled = false;
+    buffer.saw_stream_data = false;
     
     curl_easy_reset(curl);
     
