@@ -4,38 +4,6 @@ It is designed to be used in terminal for quick and easy access to information.
 The backend is powered by OpenAI's GPT-4, which is a powerful language model that can answer a wide range of questions.
 That means you need to provide an API key to use this tool.
 
-## Python Implementation
-
-### Installation
-You can install "ask" using pip:
-```bash
-pip install -r requirements.txt
-```
-Set OPENAI_API_KEY environment variable to your API key:
-```bash
-export OPENAI_API_KEY="YOUR_API_KEY"
-```
-Or you can set it in the .env file located in the root directory of the project:
-```bash
-echo "ASK_GLOBAL_MODEL=\"gpt-4-0125-preview\"
-OPENAI_API_KEY=\"YOUR_OPENAI_API_KEY\"" > .env
-```
-
-### (Optional) You can also add the "ask" script to your PATH:
-modify the ask.sh file to point to the main.py file in the root directory of the project:
-```bash
-#!/bin/bash
-cd /path/to/ask/ && python3 /path/to/ask/main.py $@
-```
-Then make the script executable:
-```bash
-chmod +x /path/to/ask/ask.sh
-```
-Then make a symbolic link to the script in /usr/local/bin:
-```bash
-sudo ln -s /path/to/ask/ask.sh /usr/local/bin/ask
-```
-
 ## Usage
 To use "ask", you need to provide an API key. You can get one from OpenAI's website.
 Once you have the API key, you can use it like this:
@@ -131,6 +99,21 @@ The C version supports the same command-line options as the Python version:
 ```
 
 In interactive mode, type "exit" to quit.
+
+### (Optional) You can also add the "ask" script to your PATH:
+modify the ask.sh file to point to the main.py file in the root directory of the project:
+```bash
+#!/bin/bash
+cd /path/to/ask/ && python3 /path/to/ask/main.py $@
+```
+Then make the script executable:
+```bash
+chmod +x /path/to/ask/ask.sh
+```
+Then make a symbolic link to the script in /usr/local/bin:
+```bash
+sudo ln -s /path/to/ask/ask.sh /usr/local/bin/ask
+```
 
 ### Other Options
 
