@@ -4,7 +4,7 @@
 
 "ask" is a simple command line tool for asking questions and getting answers.
 It is designed to be used in terminal for quick and easy access to information.
-The backend is powered by OpenAI's GPT-4, which is a powerful language model that can answer a wide range of questions.
+The backend is powered by OpenAI's GPT-5, which is a powerful language model that can answer a wide range of questions.
 That means you need to provide an API key to use this tool.
 
 ## Usage
@@ -120,6 +120,7 @@ sudo ln -s /path/to/ask/ask.sh /usr/local/bin/ask
 
 ### Other Options
 
+- `--help`: Show more help options
 - `--version` or `-v`: Show version information
 - `--tokenCount`: Display approximate token count for your message
 - `--temperature` or `-T`: Set temperature (default: 0.7)
