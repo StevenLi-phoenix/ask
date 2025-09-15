@@ -1,4 +1,7 @@
 # ASK
+
+[![Release](https://github.com/StevenLi-phoenix/ask/actions/workflows/release.yml/badge.svg)](https://github.com/StevenLi-phoenix/ask/actions/workflows/release.yml)
+
 "ask" is a simple command line tool for asking questions and getting answers.
 It is designed to be used in terminal for quick and easy access to information.
 The backend is powered by OpenAI's GPT-4, which is a powerful language model that can answer a wide range of questions.
