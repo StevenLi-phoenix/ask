@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build and Release (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential libcurl4-openssl-dev libcjson-dev
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew update
+          brew install cjson
+
+      - name: Build (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          make clean || true
+          make CFLAGS="" LDFLAGS=""
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          make clean || true
+          make
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p dist
+          OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
+          ARCH=$(uname -m)
+          # Name binary uniquely per platform
+          OUT_NAME="ask-${OS_NAME}-${ARCH}"
+          cp ask "dist/${OUT_NAME}"
+          # Create tarball
+          tar -C dist -czf "dist/${OUT_NAME}.tar.gz" "${OUT_NAME}"
+          # Create checksum file (portable)
+          if command -v sha256sum >/dev/null 2>&1; then
+            (cd dist && sha256sum "${OUT_NAME}.tar.gz" > "${OUT_NAME}.tar.gz.sha256")
+          else
+            (cd dist && shasum -a 256 "${OUT_NAME}.tar.gz" > "${OUT_NAME}.tar.gz.sha256")
+          fi
+
+      - name: Upload Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

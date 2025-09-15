@@ -150,4 +150,15 @@ In interactive mode, type "exit" to quit.
 # Contributing
 Any
 
+## Releases
+
+Tagged commits trigger the GitHub Release workflow to build and upload binaries for Linux and macOS.
+
+- Create and push a tag following `v*` format (e.g., `v0.1.0`):
+  ```bash
+  git tag v0.1.0
+  git push origin v0.1.0
+  ```
+- The workflow compiles the C version of `ask`, packages artifacts as `ask-<os>-<arch>.tar.gz`, and publishes them to the GitHub Release.
+
 
