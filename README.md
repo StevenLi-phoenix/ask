@@ -92,7 +92,7 @@ The C version uses the same configuration as the Python version. You can set you
 The C version supports the same command-line options as the Python version:
 
 ```bash
-./ask What is the capital of France?
+./ask What is the capital of France
 ```
 
 ### Interactive Mode
