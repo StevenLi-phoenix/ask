@@ -23,7 +23,7 @@
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
 
-constexpr const char *DEFAULT_MODEL = "gpt-5.1-nano";
+constexpr const char *DEFAULT_MODEL = "gpt-5-nano";
 constexpr size_t MAX_BUFFER_SIZE = 8192;
 constexpr int DEFAULT_TOKEN_LIMIT = 128000;
 constexpr const char *MODELS_CACHE_FILE = "~/.cache/ask_models_cache.json";

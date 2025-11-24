@@ -4,7 +4,7 @@
 
 `ask` is a lightweight CLI that sends chat prompts to OpenAI. It now runs as a single C++17 binary (libcurl + cJSON) and supports both one-shot replies and interactive chat.
 
-- Default model: `gpt-5.1-nano`
+- Default model: `gpt-5-nano`
 - Default temperature: `1.0`
 - Default token limit: `128000`
 
@@ -35,14 +35,14 @@ You must provide `OPENAI_API_KEY` (and optionally `ASK_GLOBAL_MODEL`):
 
 ```bash
 export OPENAI_API_KEY=sk-...
-export ASK_GLOBAL_MODEL=gpt-5.1-nano
+export ASK_GLOBAL_MODEL=GPT-5-nano
 ```
 
 Or write a `.env`:
 
 ```
 OPENAI_API_KEY=sk-...
-ASK_GLOBAL_MODEL=gpt-5.1-nano
+ASK_GLOBAL_MODEL=GPT-5-nano
 ```
 
 Or persist via flags (writes `.env`):
@@ -83,7 +83,7 @@ Attach text files inline using `@path` (up to 10KB, plain text, exact name):
 - `-c`, `--continue`        interactive conversation
 - `--no-stream`             disable SSE streaming
 - `-t`, `--token`           API key for this run
-- `-m`, `--model`           model for this run (default: gpt-5.1-nano)
+- `-m`, `--model`           model for this run (default: GPT-5-nano)
 - `-T`, `--temperature`     sampling temperature (default: 1.0)
 - `-l`, `--tokenLimit`      max tokens budget (default: 128000, approximate)
 - `--tokenCount`            print approximate token count for input and exit
