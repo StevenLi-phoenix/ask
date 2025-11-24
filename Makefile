@@ -1,14 +1,17 @@
-CC=gcc
-CFLAGS=-Wall -Wextra -I/opt/homebrew/include
+CXX=g++
+CXXFLAGS=-std=c++17 -Wall -Wextra -I/opt/homebrew/include
 LDFLAGS=-L/opt/homebrew/lib
 LIBS=-lcurl -lcjson
 
-all: ask
+BIN=ask
+SRC=main.cpp
 
-ask: main.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o ask main.c $(LIBS)
+all: $(BIN)
+
+$(BIN): $(SRC)
+	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $(BIN) $(SRC) $(LIBS)
 
 clean:
-	rm -f ask
+	rm -f $(BIN)
 
-.PHONY: all clean 
+.PHONY: all clean

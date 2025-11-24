@@ -39,7 +39,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           make clean || true
-          make CFLAGS="" LDFLAGS=""
+          make CXXFLAGS="" LDFLAGS=""
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
@@ -75,4 +75,3 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
