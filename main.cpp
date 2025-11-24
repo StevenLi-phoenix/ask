@@ -473,6 +473,14 @@ std::string process_file_references(const std::string &input) {
     size_t search_pos = 0;
 
     while ((search_pos = result.find('@', search_pos)) != std::string::npos) {
+        if (search_pos > 0) {
+            char prev = result[search_pos - 1];
+            if (!std::isspace(static_cast<unsigned char>(prev)) && prev != '(' && prev != '[' && prev != '{' && prev != '\n') {
+                search_pos += 1;
+                continue; // skip @ embedded in words/URLs (e.g., checkout@v4)
+            }
+        }
+
         size_t filename_start = search_pos + 1;
         if (filename_start >= result.size()) break;
 
@@ -538,7 +546,7 @@ std::string process_file_references(const std::string &input) {
         }
 
         result.swap(replacement);
-        search_pos = prefix.size();
+        search_pos = result.size() - suffix.size(); // continue after inserted block
     }
 
     return result;
