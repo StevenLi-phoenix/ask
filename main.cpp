@@ -23,11 +23,14 @@
 #include <curl/curl.h>
 #include <cjson/cJSON.h>
 
-constexpr const char *DEFAULT_MODEL = "gpt-5-nano";
+constexpr const char *DEFAULT_MODEL = "gpt-5.1-nano";
 constexpr size_t MAX_BUFFER_SIZE = 8192;
 constexpr int DEFAULT_TOKEN_LIMIT = 128000;
 constexpr const char *MODELS_CACHE_FILE = "~/.cache/ask_models_cache.json";
 constexpr time_t MODELS_CACHE_EXPIRY = 86400; // 24 hours
+constexpr long CONNECT_TIMEOUT = 10L;
+constexpr long REQUEST_TIMEOUT = 60L;
+constexpr int MAX_RETRIES = 1; // total attempts = MAX_RETRIES + 1
 
 enum LogLevel {
     LOG_NONE = 0,
@@ -93,6 +96,8 @@ std::optional<std::string> read_file_content(const std::string &filename);
 std::string process_file_references(const std::string &input);
 int levenshtein_distance(const std::string &s1, const std::string &s2);
 void spinner_loop(std::atomic_bool &stop_flag, std::atomic_bool &first_token_flag);
+bool print_completion_content(const std::string &body);
+void print_api_error(long http_code, const std::string &body);
 
 void init_logging() {
     if (log_to_file) {
@@ -831,6 +836,46 @@ void spinner_loop(std::atomic_bool &stop_flag, std::atomic_bool &first_token_fla
     std::cout << "\r                \r" << std::flush;
 }
 
+bool print_completion_content(const std::string &body) {
+    cJSON *json = cJSON_Parse(body.c_str());
+    if (!json) {
+        log_message(LOG_ERROR, "Failed to parse API response: %s", cJSON_GetErrorPtr());
+        return false;
+    }
+
+    bool printed = false;
+    cJSON *choices = cJSON_GetObjectItem(json, "choices");
+    if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
+        cJSON *choice = cJSON_GetArrayItem(choices, 0);
+        cJSON *message = cJSON_GetObjectItem(choice, "message");
+        if (message) {
+            cJSON *content = cJSON_GetObjectItem(message, "content");
+            if (content && cJSON_IsString(content) && content->valuestring) {
+                std::cout << content->valuestring << "\n";
+                printed = true;
+            }
+        }
+    }
+    cJSON_Delete(json);
+    return printed;
+}
+
+void print_api_error(long http_code, const std::string &body) {
+    cJSON *err = cJSON_Parse(body.c_str());
+    if (err) {
+        cJSON *error_obj = cJSON_GetObjectItem(err, "error");
+        cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : nullptr;
+        if (msg && cJSON_IsString(msg) && msg->valuestring) {
+            std::fprintf(stderr, "API error (HTTP %ld): %s\n", http_code, msg->valuestring);
+        } else {
+            std::fprintf(stderr, "API error (HTTP %ld).\n", http_code);
+        }
+        cJSON_Delete(err);
+    } else {
+        std::fprintf(stderr, "API error (HTTP %ld).\n", http_code);
+    }
+}
+
 void suggest_similar_model(const std::string &invalid_model) {
     if (models_cache.models.empty()) return;
 
@@ -907,16 +952,12 @@ void ask(CURL *curl, std::vector<Message> &messages, double temperature, bool no
         headers = curl_slist_append(headers, "Accept: text/event-stream");
     }
 
-    const long CONNECT_TIMEOUT = 10L;
-    const long REQUEST_TIMEOUT = 60L;
-    const int max_retries = 1; // total attempts = max_retries + 1
-
     int attempt = 0;
     bool done = false;
 
-    while (!done && attempt <= max_retries) {
+    while (!done && attempt <= MAX_RETRIES) {
         attempt++;
-        log_message(LOG_INFO, "Attempt %d/%d", attempt, max_retries + 1);
+        log_message(LOG_INFO, "Attempt %d/%d", attempt, MAX_RETRIES + 1);
 
         std::atomic_bool spinner_stop(false);
         std::atomic_bool first_token_received(false);
@@ -948,9 +989,9 @@ void ask(CURL *curl, std::vector<Message> &messages, double temperature, bool no
 
         if (res != CURLE_OK) {
             log_message(LOG_ERROR, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
-            bool should_retry = (res == CURLE_OPERATION_TIMEDOUT) && attempt <= max_retries;
+            bool should_retry = (res == CURLE_OPERATION_TIMEDOUT) && attempt <= MAX_RETRIES;
             if (should_retry) {
-                std::cout << "Request timed out, retrying (" << attempt << "/" << max_retries + 1 << ")...\n";
+                std::cout << "Request timed out, retrying (" << attempt << "/" << MAX_RETRIES + 1 << ")...\n";
                 continue;
             } else {
                 std::fprintf(stderr, "Request failed: %s\n", curl_easy_strerror(res));
@@ -958,61 +999,14 @@ void ask(CURL *curl, std::vector<Message> &messages, double temperature, bool no
         } else {
             log_message(LOG_INFO, "Request completed successfully");
             log_message(LOG_DEBUG, "Response size: %zu bytes", buffer.data.size());
-
             if (http_code >= 400) {
-                cJSON *err = cJSON_Parse(buffer.data.c_str());
-                if (err) {
-                    cJSON *error_obj = cJSON_GetObjectItem(err, "error");
-                    cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : nullptr;
-                    if (msg && cJSON_IsString(msg) && msg->valuestring) {
-                        std::fprintf(stderr, "API error (HTTP %ld): %s\n", http_code, msg->valuestring);
-                    } else {
-                        std::fprintf(stderr, "API error (HTTP %ld).\n", http_code);
-                    }
-                    cJSON_Delete(err);
-                } else {
-                    std::fprintf(stderr, "API error (HTTP %ld).\n", http_code);
-                }
+                print_api_error(http_code, buffer.data);
             } else if (no_stream) {
-                cJSON *json = cJSON_Parse(buffer.data.c_str());
-                if (json) {
-                    cJSON *choices = cJSON_GetObjectItem(json, "choices");
-                    if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-                        cJSON *choice = cJSON_GetArrayItem(choices, 0);
-                        cJSON *message = cJSON_GetObjectItem(choice, "message");
-                        if (message) {
-                            cJSON *content = cJSON_GetObjectItem(message, "content");
-                            if (content && cJSON_IsString(content) && content->valuestring) {
-                                std::cout << content->valuestring << "\n";
-                            }
-                        }
-                    }
-                    cJSON_Delete(json);
-                } else {
-                    log_message(LOG_ERROR, "Failed to parse API response: %s", cJSON_GetErrorPtr());
-                }
+                print_completion_content(buffer.data);
             } else {
                 if (!buffer.saw_stream_data && !buffer.data.empty()) {
-                    cJSON *json = cJSON_Parse(buffer.data.c_str());
-                    if (json) {
-                        cJSON *choices = cJSON_GetObjectItem(json, "choices");
-                        if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-                            cJSON *choice = cJSON_GetArrayItem(choices, 0);
-                            cJSON *message = cJSON_GetObjectItem(choice, "message");
-                            if (message) {
-                                cJSON *content = cJSON_GetObjectItem(message, "content");
-                                if (content && cJSON_IsString(content) && content->valuestring) {
-                                    std::cout << content->valuestring << "\n";
-                                }
-                            }
-                        } else {
-                            cJSON *error_obj = cJSON_GetObjectItem(json, "error");
-                            cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : nullptr;
-                            if (msg && cJSON_IsString(msg) && msg->valuestring) {
-                                std::fprintf(stderr, "API error: %s\n", msg->valuestring);
-                            }
-                        }
-                        cJSON_Delete(json);
+                    if (!print_completion_content(buffer.data)) {
+                        print_api_error(http_code, buffer.data);
                     }
                 }
                 std::cout << std::endl;
