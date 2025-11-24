@@ -17,7 +17,7 @@
 #define DEFAULT_TOKEN_LIMIT 128000
 #define MAX_MESSAGES 100
 #define MAX_MODELS 200
-#define MODELS_CACHE_FILE "~/.ask_models_cache.json"
+#define MODELS_CACHE_FILE "~/.cache/ask_models_cache.json"
 #define MODELS_CACHE_EXPIRY 86400 // 24 hours in seconds
 
 // Log levels
