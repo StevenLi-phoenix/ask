@@ -509,6 +509,13 @@ std::string process_file_references(const std::string &input) {
 
         std::string filename = result.substr(filename_start, filename_end - filename_start);
         size_t suffix_start = filename_end;
+        while (!filename.empty() && (filename.back() == '"' || filename.back() == '\'' || filename.back() == '`')) {
+            filename.pop_back();
+        }
+        if (filename.empty()) {
+            search_pos = suffix_start;
+            continue;
+        }
         if (quoted && suffix_start < result.size() && result[suffix_start] == quote_char) {
             ++suffix_start;
         }
