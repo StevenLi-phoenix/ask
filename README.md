@@ -2,150 +2,99 @@
 
 [![Release](https://github.com/StevenLi-phoenix/ask/actions/workflows/release.yml/badge.svg)](https://github.com/StevenLi-phoenix/ask/actions/workflows/release.yml)
 
-"ask" is a simple command line tool for asking questions and getting answers.
-It is designed to be used in terminal for quick and easy access to information.
-The backend is powered by OpenAI's GPT-5, which is a powerful language model that can answer a wide range of questions.
-That means you need to provide an API key to use this tool.
+`ask` is a lightweight CLI that sends chat prompts to OpenAI. It now runs as a single C++17 binary (libcurl + cJSON) and supports both one-shot replies and interactive chat.
 
-## Usage
-To use "ask", you need to provide an API key. You can get one from OpenAI's website.
-Once you have the API key, you can use it like this:
-```bash
-ask ANY_THING
-```
+- Default model: `gpt-5.1-nano`
+- Default temperature: `1.0`
+- Default token limit: `128000`
 
-The default model is "gpt-4" and the default temperature is 0.7. You can change these settings using command line options:
-```bash
-ask --model gpt-4 --temperature 0.7 ANY_THING
-```
+## Build
 
-The default token limit is 128000. You can change this using the --tokens option:
-```bash
-ask -l 16000 ANY_THING
-```
+Dependencies: g++ (C++17), libcurl, cJSON.
 
-Use the --stream option to keep the chat completion open and wait for more input:
-```bash
-ask -s
-```
-
-for more information, you can use the --help option:
-```bash
-ask --help
-```
-
-# C Implementation
-
-A C version of the program is also available.
-
-## Requirements
-
-- GCC or compatible C compiler
-- libcurl development libraries
-- cJSON library
-
-On macOS, you can install the required libraries with:
-
+macOS:
 ```bash
 brew install curl cjson
-```
-
-On Ubuntu/Debian:
-
-```bash
-sudo apt-get install libcurl4-openssl-dev libcjson-dev
-```
-
-## Building
-
-To build the C version, simply run:
-
-```bash
 make
 ```
 
-This will produce an executable called `ask`.
+Ubuntu/Debian:
+```bash
+sudo apt-get update
+sudo apt-get install -y g++ libcurl4-openssl-dev libcjson-dev
+make
+```
 
-## Setup
+This produces the `ask` binary. `ask.sh` is a helper wrapper that runs it from the repo root.
 
-The C version uses the same configuration as the Python version. You can set your OpenAI API key in several ways:
+## Configure API key / model
 
-1. Create a `.env` file with the following content:
-   ```
-   OPENAI_API_KEY=your_api_key_here
-   ASK_GLOBAL_MODEL=gpt-4o-mini
-   ```
+You must provide `OPENAI_API_KEY` (and optionally `ASK_GLOBAL_MODEL`):
+```bash
+export OPENAI_API_KEY=sk-...
+export ASK_GLOBAL_MODEL=gpt-5.1-nano
+```
 
-2. Set environment variables:
-   ```bash
-   export OPENAI_API_KEY=your_api_key_here
-   export ASK_GLOBAL_MODEL=gpt-4o-mini
-   ```
+Or write a `.env`:
+```
+OPENAI_API_KEY=sk-...
+ASK_GLOBAL_MODEL=gpt-5.1-nano
+```
 
-3. Use command-line options to set them:
-   ```bash
-   ./ask --setAPIKey your_api_key_here --setModel gpt-4o-mini
-   ```
+Or persist via flags (writes `.env`):
+```bash
+./ask --setAPIKey sk-... --setModel gpt-4o-mini
+```
 
 ## Usage
 
-The C version supports the same command-line options as the Python version:
-
+One-shot:
 ```bash
-./ask What is the capital of France
+./ask "What is the capital of France?"
 ```
 
-### Interactive Mode
-
+Interactive:
 ```bash
-./ask -s Tell me a story
+./ask -c "Let's chat"
+# then type messages; use `exit` to quit, `status` to view token/model info
 ```
 
-In interactive mode, type "exit" to quit.
-
-### (Optional) You can also add the "ask" script to your PATH:
-modify the ask.sh file to point to the main.py file in the root directory of the project:
+Disable streaming (receive full response at once):
 ```bash
-#!/bin/bash
-cd /path/to/ask/ && python3 /path/to/ask/main.py $@
-```
-Then make the script executable:
-```bash
-chmod +x /path/to/ask/ask.sh
-```
-Then make a symbolic link to the script in /usr/local/bin:
-```bash
-sudo ln -s /path/to/ask/ask.sh /usr/local/bin/ask
+./ask --no-stream "Tell me a story"
 ```
 
-### Other Options
+Attach text files inline using `@path` (up to 10KB, plain text):
+```bash
+./ask "Summarize @README.md"
+```
 
-- `--help`: Show more help options
-- `--version` or `-v`: Show version information
-- `--tokenCount`: Display approximate token count for your message
-- `--temperature` or `-T`: Set temperature (default: 0.7)
-- `--tokenLimit` or `-l`: Set maximum token limit (default: 128000)
-- `--token` or `-t`: Set API token for just this session
-- `--model` or `-m`: Set model for just this session
-- `--debug`: Show debug information
+## Flags (selected)
 
-## Notes
+- `-c`, `--continue`        interactive conversation
+- `--no-stream`             disable SSE streaming
+- `-t`, `--token`           API key for this run
+- `-m`, `--model`           model for this run (default: gpt-5.1-nano)
+- `-T`, `--temperature`     sampling temperature (default: 1.0)
+- `-l`, `--tokenLimit`      max tokens budget (default: 128000, approximate)
+- `--tokenCount`            print approximate token count for input and exit
+- `--debug` / `--log LEVEL` set log verbosity; `--logfile FILE` to log to file
+- `--setAPIKey`, `--setModel` persist to `.env`
+- `--help`, `--version`     info
 
-- Token counting in the C version is approximate and not as accurate as tiktoken in Python
-- The C version uses libcurl for HTTP requests and cJSON for JSON parsing
-
-# Contributing
-Any
+Token counting is approximate; streaming prints chunks as they arrive and falls back to full JSON if needed.
 
 ## Releases
 
-Tagged commits trigger the GitHub Release workflow to build and upload binaries for Linux and macOS.
+Tags matching `v*` trigger GitHub Actions to build and upload tarballs:
+```bash
+git tag v0.2
+git push origin v0.2
+```
 
-- Create and push a tag following `v*` format (e.g., `v0.1.0`):
-  ```bash
-  git tag v0.1.0
-  git push origin v0.1.0
-  ```
-- The workflow compiles the C version of `ask`, packages artifacts as `ask-<os>-<arch>.tar.gz`, and publishes them to the GitHub Release.
+Artifacts are published as `ask-<os>-<arch>.tar.gz` with SHA256 checksums for Linux and macOS.
 
+## Contributing
+
+Issues and PRs welcome. Keep changes portable (Linux/macOS) and stay within the C++17 toolchain used in `Makefile`.
 
