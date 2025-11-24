@@ -13,12 +13,14 @@
 Dependencies: g++ (C++17), libcurl, cJSON.
 
 macOS:
+
 ```bash
 brew install curl cjson
 make
 ```
 
 Ubuntu/Debian:
+
 ```bash
 sudo apt-get update
 sudo apt-get install -y g++ libcurl4-openssl-dev libcjson-dev
@@ -30,18 +32,21 @@ This produces the `ask` binary. `ask.sh` is a helper wrapper that runs it from t
 ## Configure API key / model
 
 You must provide `OPENAI_API_KEY` (and optionally `ASK_GLOBAL_MODEL`):
+
 ```bash
 export OPENAI_API_KEY=sk-...
 export ASK_GLOBAL_MODEL=gpt-5.1-nano
 ```
 
 Or write a `.env`:
+
 ```
 OPENAI_API_KEY=sk-...
 ASK_GLOBAL_MODEL=gpt-5.1-nano
 ```
 
 Or persist via flags (writes `.env`):
+
 ```bash
 ./ask --setAPIKey sk-... --setModel gpt-4o-mini
 ```
@@ -49,22 +54,26 @@ Or persist via flags (writes `.env`):
 ## Usage
 
 One-shot:
+
 ```bash
 ./ask "What is the capital of France?"
 ```
 
 Interactive:
+
 ```bash
 ./ask -c "Let's chat"
 # then type messages; use `exit` to quit, `status` to view token/model info
 ```
 
 Disable streaming (receive full response at once):
+
 ```bash
 ./ask --no-stream "Tell me a story"
 ```
 
-Attach text files inline using `@path` (up to 10KB, plain text):
+Attach text files inline using `@path` (up to 10KB, plain text, exact name):
+
 ```bash
 ./ask "Summarize @README.md"
 ```
@@ -83,10 +92,12 @@ Attach text files inline using `@path` (up to 10KB, plain text):
 - `--help`, `--version`     info
 
 Token counting is approximate; streaming prints chunks as they arrive and falls back to full JSON if needed.
+The CLI shows a short “thinking…” spinner and retries once on timeout (60s) so you see progress instead of hanging.
 
 ## Releases
 
 Tags matching `v*` trigger GitHub Actions to build and upload tarballs:
+
 ```bash
 git tag v0.2
 git push origin v0.2
@@ -97,4 +108,3 @@ Artifacts are published as `ask-<os>-<arch>.tar.gz` with SHA256 checksums for Li
 ## Contributing
 
 Issues and PRs welcome. Keep changes portable (Linux/macOS) and stay within the C++17 toolchain used in `Makefile`.
-

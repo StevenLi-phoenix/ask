@@ -1,6 +1,8 @@
 // C++ rewrite of the ask CLI
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +16,7 @@
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -38,6 +41,7 @@ struct ResponseBuffer {
     std::string data;
     bool stream_enabled{false};
     bool saw_stream_data{false};
+    std::atomic_bool *first_token_flag{nullptr};
 };
 
 struct Message {
@@ -88,6 +92,7 @@ bool is_plain_text_file(const std::string &filename);
 std::optional<std::string> read_file_content(const std::string &filename);
 std::string process_file_references(const std::string &input);
 int levenshtein_distance(const std::string &s1, const std::string &s2);
+void spinner_loop(std::atomic_bool &stop_flag, std::atomic_bool &first_token_flag);
 
 void init_logging() {
     if (log_to_file) {
@@ -172,6 +177,9 @@ void load_dotenv(const std::string &filename) {
 size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
     size_t realsize = size * nmemb;
     auto *buffer = static_cast<ResponseBuffer *>(userp);
+    if (buffer->first_token_flag) {
+        buffer->first_token_flag->store(true);
+    }
     buffer->data.append(static_cast<char *>(contents), realsize);
 
     if (buffer->stream_enabled) {
@@ -197,6 +205,9 @@ size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
                                 std::cout << content->valuestring;
                                 std::cout.flush();
                                 buffer->saw_stream_data = true;
+                                if (buffer->first_token_flag) {
+                                    buffer->first_token_flag->store(true);
+                                }
                             }
                         }
                     }
@@ -789,6 +800,22 @@ int levenshtein_distance(const std::string &s1, const std::string &s2) {
     return matrix[len1][len2];
 }
 
+void spinner_loop(std::atomic_bool &stop_flag, std::atomic_bool &first_token_flag) {
+    const char frames[] = {'|', '/', '-', '\\'};
+    size_t idx = 0;
+    std::cout << "thinking... " << std::flush;
+    while (!stop_flag.load()) {
+        if (first_token_flag.load()) {
+            std::cout << "\r                \r" << std::flush;
+            return;
+        }
+        std::cout << "\rthinking... " << frames[idx % 4] << std::flush;
+        idx++;
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+    std::cout << "\r                \r" << std::flush;
+}
+
 void suggest_similar_model(const std::string &invalid_model) {
     if (models_cache.models.empty()) return;
 
@@ -865,61 +892,74 @@ void ask(CURL *curl, std::vector<Message> &messages, double temperature, bool no
         headers = curl_slist_append(headers, "Accept: text/event-stream");
     }
 
-    ResponseBuffer buffer;
-    buffer.stream_enabled = !no_stream;
+    const long CONNECT_TIMEOUT = 10L;
+    const long REQUEST_TIMEOUT = 60L;
+    const int max_retries = 1; // total attempts = max_retries + 1
 
-    curl_easy_reset(curl);
-    curl_easy_setopt(curl, CURLOPT_URL, "https://api.openai.com/v1/chat/completions");
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+    int attempt = 0;
+    bool done = false;
 
-    log_message(LOG_INFO, "Sending request to API...");
-    CURLcode res = curl_easy_perform(curl);
-    long http_code = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    while (!done && attempt <= max_retries) {
+        attempt++;
+        std::cout << "Attempt " << attempt << " (timeout " << REQUEST_TIMEOUT << "s)...\n";
+        log_message(LOG_INFO, "Attempt %d/%d", attempt, max_retries + 1);
 
-    if (res != CURLE_OK) {
-        log_message(LOG_ERROR, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
-    } else {
-        log_message(LOG_INFO, "Request completed successfully");
-        log_message(LOG_DEBUG, "Response size: %zu bytes", buffer.data.size());
+        std::atomic_bool spinner_stop(false);
+        std::atomic_bool first_token_received(false);
 
-        if (http_code >= 400) {
-            cJSON *err = cJSON_Parse(buffer.data.c_str());
-            if (err) {
-                cJSON *error_obj = cJSON_GetObjectItem(err, "error");
-                cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : nullptr;
-                if (msg && cJSON_IsString(msg) && msg->valuestring) {
-                    std::fprintf(stderr, "API error (HTTP %ld): %s\n", http_code, msg->valuestring);
+        ResponseBuffer buffer;
+        buffer.stream_enabled = !no_stream;
+        buffer.first_token_flag = &first_token_received;
+
+        std::thread spinner_thread(spinner_loop, std::ref(spinner_stop), std::ref(first_token_received));
+
+        curl_easy_reset(curl);
+        curl_easy_setopt(curl, CURLOPT_URL, "https://api.openai.com/v1/chat/completions");
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, json_str);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, REQUEST_TIMEOUT);
+
+        log_message(LOG_INFO, "Sending request to API...");
+        CURLcode res = curl_easy_perform(curl);
+        long http_code = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+        spinner_stop.store(true);
+        if (spinner_thread.joinable()) {
+            spinner_thread.join();
+        }
+
+        if (res != CURLE_OK) {
+            log_message(LOG_ERROR, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
+            bool should_retry = (res == CURLE_OPERATION_TIMEDOUT) && attempt <= max_retries;
+            if (should_retry) {
+                std::cout << "Request timed out, retrying (" << attempt << "/" << max_retries + 1 << ")...\n";
+                continue;
+            } else {
+                std::fprintf(stderr, "Request failed: %s\n", curl_easy_strerror(res));
+            }
+        } else {
+            log_message(LOG_INFO, "Request completed successfully");
+            log_message(LOG_DEBUG, "Response size: %zu bytes", buffer.data.size());
+
+            if (http_code >= 400) {
+                cJSON *err = cJSON_Parse(buffer.data.c_str());
+                if (err) {
+                    cJSON *error_obj = cJSON_GetObjectItem(err, "error");
+                    cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : nullptr;
+                    if (msg && cJSON_IsString(msg) && msg->valuestring) {
+                        std::fprintf(stderr, "API error (HTTP %ld): %s\n", http_code, msg->valuestring);
+                    } else {
+                        std::fprintf(stderr, "API error (HTTP %ld).\n", http_code);
+                    }
+                    cJSON_Delete(err);
                 } else {
                     std::fprintf(stderr, "API error (HTTP %ld).\n", http_code);
                 }
-                cJSON_Delete(err);
-            } else {
-                std::fprintf(stderr, "API error (HTTP %ld).\n", http_code);
-            }
-        } else if (no_stream) {
-            cJSON *json = cJSON_Parse(buffer.data.c_str());
-            if (json) {
-                cJSON *choices = cJSON_GetObjectItem(json, "choices");
-                if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
-                    cJSON *choice = cJSON_GetArrayItem(choices, 0);
-                    cJSON *message = cJSON_GetObjectItem(choice, "message");
-                    if (message) {
-                        cJSON *content = cJSON_GetObjectItem(message, "content");
-                        if (content && cJSON_IsString(content) && content->valuestring) {
-                            std::cout << content->valuestring << "\n";
-                        }
-                    }
-                }
-                cJSON_Delete(json);
-            } else {
-                log_message(LOG_ERROR, "Failed to parse API response: %s", cJSON_GetErrorPtr());
-            }
-        } else {
-            if (!buffer.saw_stream_data && !buffer.data.empty()) {
+            } else if (no_stream) {
                 cJSON *json = cJSON_Parse(buffer.data.c_str());
                 if (json) {
                     cJSON *choices = cJSON_GetObjectItem(json, "choices");
@@ -932,18 +972,40 @@ void ask(CURL *curl, std::vector<Message> &messages, double temperature, bool no
                                 std::cout << content->valuestring << "\n";
                             }
                         }
-                    } else {
-                        cJSON *error_obj = cJSON_GetObjectItem(json, "error");
-                        cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : nullptr;
-                        if (msg && cJSON_IsString(msg) && msg->valuestring) {
-                            std::fprintf(stderr, "API error: %s\n", msg->valuestring);
-                        }
                     }
                     cJSON_Delete(json);
+                } else {
+                    log_message(LOG_ERROR, "Failed to parse API response: %s", cJSON_GetErrorPtr());
                 }
+            } else {
+                if (!buffer.saw_stream_data && !buffer.data.empty()) {
+                    cJSON *json = cJSON_Parse(buffer.data.c_str());
+                    if (json) {
+                        cJSON *choices = cJSON_GetObjectItem(json, "choices");
+                        if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
+                            cJSON *choice = cJSON_GetArrayItem(choices, 0);
+                            cJSON *message = cJSON_GetObjectItem(choice, "message");
+                            if (message) {
+                                cJSON *content = cJSON_GetObjectItem(message, "content");
+                                if (content && cJSON_IsString(content) && content->valuestring) {
+                                    std::cout << content->valuestring << "\n";
+                                }
+                            }
+                        } else {
+                            cJSON *error_obj = cJSON_GetObjectItem(json, "error");
+                            cJSON *msg = error_obj ? cJSON_GetObjectItem(error_obj, "message") : nullptr;
+                            if (msg && cJSON_IsString(msg) && msg->valuestring) {
+                                std::fprintf(stderr, "API error: %s\n", msg->valuestring);
+                            }
+                        }
+                        cJSON_Delete(json);
+                    }
+                }
+                std::cout << std::endl;
             }
-            std::cout << std::endl;
         }
+
+        done = true;
     }
 
     curl_slist_free_all(headers);
