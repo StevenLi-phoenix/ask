@@ -1,1 +1,21 @@
-Migrate to GPT-5-nano
+- new branch: feature/function-calling
+- add support for image inputs (path or paste from clipboard)
+- add support for function calling (dangerous) (the command will be executed represented by the user)
+   per msg function calling allowance, request approval from the user
+  -- bash / zsh 
+
+
+- new branch: feature/responses-api
+- switch from Chat Completions to the Responses API
+- add Tools supported by this model when using the Responses API.
+  -- web_search (by openai)
+  -- Image generation (by openai)
+  -- File search (by openai) (require uploading file to vector database)
+  -- Code interpreter (by openai)
+  -- MCPs
+- add config options for:
+  -- models
+  -- max output tokens
+  -- allowed function calling
+  -- allowed tools
+  -- config MCPs
