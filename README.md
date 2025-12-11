@@ -4,8 +4,7 @@
 
 `ask` is a lightweight CLI that sends chat prompts to OpenAI. It now runs as a single C++17 binary (libcurl + cJSON) and supports both one-shot replies and interactive chat.
 
-- Default model: `gpt-5-nano`
-- Default temperature: `1.0`
+- Default model: `gpt-5.2-latest-chat` (Also known as chatgpt 5.2 instant)
 - Default token limit: `128000`
 
 ## Build
@@ -35,20 +34,20 @@ You must provide `OPENAI_API_KEY` (and optionally `ASK_GLOBAL_MODEL`):
 
 ```bash
 export OPENAI_API_KEY=sk-...
-export ASK_GLOBAL_MODEL=GPT-5-nano
+export ASK_GLOBAL_MODEL=gpt-5.2-latest-chat
 ```
 
 Or write a `.env`:
 
 ```
 OPENAI_API_KEY=sk-...
-ASK_GLOBAL_MODEL=GPT-5-nano
+ASK_GLOBAL_MODEL=gpt-5.2-latest-chat
 ```
 
 Or persist via flags (writes `.env`):
 
 ```bash
-./ask --setAPIKey sk-... --setModel gpt-4o-mini
+./ask --setAPIKey sk-... --setModel gpt-5.2-latest-chat
 ```
 
 ## Usage
@@ -83,7 +82,7 @@ Attach text files inline using `@path` (up to 10KB, plain text, exact name):
 - `-c`, `--continue`        interactive conversation
 - `--no-stream`             disable SSE streaming
 - `-t`, `--token`           API key for this run
-- `-m`, `--model`           model for this run (default: GPT-5-nano)
+- `-m`, `--model`           model for this run (default: gpt-5.2-latest-chat)
 - `-T`, `--temperature`     sampling temperature (default: 1.0)
 - `-l`, `--tokenLimit`      max tokens budget (default: 128000, approximate)
 - `--tokenCount`            print approximate token count for input and exit
@@ -99,8 +98,8 @@ The CLI shows a short “thinking…” spinner and retries once on timeout (60s
 Tags matching `v*` trigger GitHub Actions to build and upload tarballs:
 
 ```bash
-git tag v0.2
-git push origin v0.2
+git tag v1.0
+git push origin v1.0
 ```
 
 Artifacts are published as `ask-<os>-<arch>.tar.gz` with SHA256 checksums for Linux and macOS.
