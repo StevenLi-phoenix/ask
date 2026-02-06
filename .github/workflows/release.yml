@@ -27,25 +27,20 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential libcurl4-openssl-dev libcjson-dev
+            build-essential libcurl4-openssl-dev
 
-      - name: Install dependencies (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew update
-          brew install cjson
-
-      - name: Build (Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          make clean || true
-          make CXXFLAGS="" LDFLAGS=""
-
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
+      - name: Build
         run: |
           make clean || true
           make
+
+      - name: Verify static cjson linkage
+        shell: bash
+        run: |
+          if ldd ./ask 2>/dev/null | grep -q cjson; then
+            echo "ERROR: ask still dynamically links cjson"
+            exit 1
+          fi
 
       - name: Package artifacts
         shell: bash
@@ -54,12 +49,9 @@ jobs:
           mkdir -p dist
           OS_NAME=$(echo "${{ runner.os }}" | tr '[:upper:]' '[:lower:]')
           ARCH=$(uname -m)
-          # Name binary uniquely per platform
           OUT_NAME="ask-${OS_NAME}-${ARCH}"
           cp ask "dist/${OUT_NAME}"
-          # Create tarball
           tar -C dist -czf "dist/${OUT_NAME}.tar.gz" "${OUT_NAME}"
-          # Create checksum file (portable)
           if command -v sha256sum >/dev/null 2>&1; then
             (cd dist && sha256sum "${OUT_NAME}.tar.gz" > "${OUT_NAME}.tar.gz.sha256")
           else

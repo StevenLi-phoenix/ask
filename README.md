@@ -2,19 +2,20 @@
 
 [![Release](https://github.com/StevenLi-phoenix/ask/actions/workflows/release.yml/badge.svg)](https://github.com/StevenLi-phoenix/ask/actions/workflows/release.yml)
 
-`ask` is a lightweight CLI that sends chat prompts to OpenAI. It now runs as a single C++17 binary (libcurl + cJSON) and supports both one-shot replies and interactive chat.
+`ask` is a lightweight CLI that sends chat prompts to OpenAI. It runs as a single C++17 binary (libcurl + vendored cJSON) and supports both one-shot replies and interactive chat.
 
-- Default model: `gpt-5.2-latest-chat` (Also known as chatgpt 5.2 instant)
+- Default model: `gpt-5.2-chat-latest` (also known as ChatGPT 5.2 instant)
+- Default temperature: `1.0`
 - Default token limit: `128000`
 
 ## Build
 
-Dependencies: g++ (C++17), libcurl, cJSON.
+Dependencies: g++ (C++17), libcurl. cJSON is vendored in `vendor/cjson/`.
 
 macOS:
 
 ```bash
-brew install curl cjson
+brew install curl
 make
 ```
 
@@ -22,11 +23,11 @@ Ubuntu/Debian:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y g++ libcurl4-openssl-dev libcjson-dev
+sudo apt-get install -y g++ libcurl4-openssl-dev
 make
 ```
 
-This produces the `ask` binary. `ask.sh` is a helper wrapper that runs it from the repo root.
+This produces the `ask` binary.
 
 ## Configure API key / model
 
@@ -34,20 +35,20 @@ You must provide `OPENAI_API_KEY` (and optionally `ASK_GLOBAL_MODEL`):
 
 ```bash
 export OPENAI_API_KEY=sk-...
-export ASK_GLOBAL_MODEL=gpt-5.2-latest-chat
+export ASK_GLOBAL_MODEL=gpt-5.2-chat-latest
 ```
 
 Or write a `.env`:
 
 ```
 OPENAI_API_KEY=sk-...
-ASK_GLOBAL_MODEL=gpt-5.2-latest-chat
+ASK_GLOBAL_MODEL=gpt-5.2-chat-latest
 ```
 
 Or persist via flags (writes `.env`):
 
 ```bash
-./ask --setAPIKey sk-... --setModel gpt-5.2-latest-chat
+./ask --setAPIKey sk-... --setModel gpt-5.2-chat-latest
 ```
 
 ## Usage
@@ -71,27 +72,47 @@ Disable streaming (receive full response at once):
 ./ask --no-stream "Tell me a story"
 ```
 
-Attach text files inline using `@path` (up to 10KB, plain text, exact name):
+Set a custom system prompt:
+
+```bash
+./ask -s "You are a pirate" "Hello there"
+```
+
+Raw output mode (no spinner, minimal formatting — useful for piping):
+
+```bash
+./ask --raw "Give me a JSON example" | jq .
+```
+
+Attach text files inline using `@path`. The file content is injected directly into the prompt text — no vector storage or file uploads to OpenAI. Files over the size limit (default 10KB) trigger an interactive prompt in a terminal, or are silently skipped when piped:
 
 ```bash
 ./ask "Summarize @README.md"
+./ask --fileLimit 50000 "Explain @largefile.cpp"   # raise limit to 50KB
 ```
 
-## Flags (selected)
+## Flags
 
-- `-c`, `--continue`        interactive conversation
-- `--no-stream`             disable SSE streaming
-- `-t`, `--token`           API key for this run
-- `-m`, `--model`           model for this run (default: gpt-5.2-latest-chat)
-- `-T`, `--temperature`     sampling temperature (default: 1.0)
-- `-l`, `--tokenLimit`      max tokens budget (default: 128000, approximate)
-- `--tokenCount`            print approximate token count for input and exit
-- `--debug` / `--log LEVEL` set log verbosity; `--logfile FILE` to log to file
-- `--setAPIKey`, `--setModel` persist to `.env`
-- `--help`, `--version`     info
+| Flag | Description |
+|---|---|
+| `-h`, `--help` | Display help message |
+| `-v`, `--version` | Display version information |
+| `-c`, `--continue` | Interactive conversation mode |
+| `--no-stream` | Disable SSE streaming (wait for full response) |
+| `--raw` | Raw output mode (no spinner, minimal formatting) |
+| `-s`, `--system PROMPT` | Set custom system prompt |
+| `-t`, `--token TOKEN` | API key for this run |
+| `-m`, `--model MODEL` | Model for this run (default: `gpt-5.2-chat-latest`) |
+| `-T`, `--temperature VAL` | Sampling temperature, 0.0–2.0 (default: 1.0) |
+| `-l`, `--tokenLimit NUM` | Max tokens budget (default: 128000) |
+| `-F`, `--fileLimit NUM` | `@file` size limit in bytes (default: 10000) |
+| `--tokenCount` | Print approximate token count for input and exit |
+| `--debug` / `--log LEVEL` | Set log verbosity (`none`, `error`, `warn`, `info`, `debug`) |
+| `--logfile FILE` | Log output to a file |
+| `--setAPIKey KEY` | Persist API key to `.env` |
+| `--setModel MODEL` | Persist model to `.env` |
 
-Token counting is approximate; streaming prints chunks as they arrive and falls back to full JSON if needed.
-The CLI shows a short “thinking…” spinner and retries once on timeout (60s) so you see progress instead of hanging.
+Token counting is approximate. Streaming prints chunks as they arrive and falls back to full JSON if needed. The CLI shows a "thinking..." spinner and retries once on timeout (60s).
 
 ## Releases
 

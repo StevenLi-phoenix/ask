@@ -1,12 +1,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cstdarg>
 #include <ctime>
+#include <fcntl.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -20,7 +22,7 @@
 #include <vector>
 
 #include <curl/curl.h>
-#include <cjson/cJSON.h>
+#include "vendor/cjson/cJSON.h"
 
 namespace {
 
@@ -58,8 +60,10 @@ struct ModelsCacheData {
 
 struct ResponseBuffer {
     std::string data;
+    std::string responseContent;
     bool streamEnabled{false};
     bool sawStreamData{false};
+    bool rawMode{false};
     std::atomic_bool *firstTokenFlag{nullptr};
     class Logger *logger{nullptr};
 };
@@ -143,7 +147,9 @@ private:
 struct Settings {
     std::string apiKey;
     std::string model = DEFAULT_MODEL;
+    std::string systemPrompt;
     int tokenLimit = DEFAULT_TOKEN_LIMIT;
+    int fileSizeLimit = 10000;
     bool debugMode{false};
     LogLevel logLevel{LogLevel::Info};
     bool logToFile{false};
@@ -163,18 +169,19 @@ public:
             return path;
         }
 
+        if (pw->pw_dir == nullptr) {
+            logger.log(LogLevel::Error, "Home directory path is null");
+            return path;
+        }
+
         std::string expanded = pw->pw_dir;
         expanded += path.substr(1);
 
         auto lastSlash = expanded.find_last_of('/');
         if (lastSlash != std::string::npos) {
             std::string dir = expanded.substr(0, lastSlash);
-            struct stat st{};
-            if (stat(dir.c_str(), &st) == -1) {
-                logger.log(LogLevel::Info, "Creating directory: %s", dir.c_str());
-                if (mkdir(dir.c_str(), 0700) == -1) {
-                    logger.log(LogLevel::Error, "Failed to create directory: %s", dir.c_str());
-                }
+            if (mkdir(dir.c_str(), 0700) == -1 && errno != EEXIST) {
+                logger.log(LogLevel::Error, "Failed to create directory: %s", dir.c_str());
             }
         }
 
@@ -213,7 +220,7 @@ public:
         return true;
     }
 
-    static std::optional<std::string> readFileContent(const std::string &filename, Logger &logger) {
+    static std::optional<std::string> readFileContent(const std::string &filename, Logger &logger, int fileSizeLimit = 10000, bool interactive = false) {
         std::ifstream file(filename);
         if (!file.is_open()) {
             logger.log(LogLevel::Error, "Failed to open file: %s", filename.c_str());
@@ -228,9 +235,20 @@ public:
             return std::string();
         }
 
-        if (fileSize > 10000) { // 10KB limit
-            logger.log(LogLevel::Warn, "File too large (>10KB): %s", filename.c_str());
-            return std::nullopt;
+        if (fileSize > fileSizeLimit) {
+            if (interactive) {
+                std::fprintf(stderr, "File '%s' is %ldKB (limit: %dKB). Include anyway? [y/N]: ",
+                    filename.c_str(), static_cast<long>(fileSize) / 1000, fileSizeLimit / 1000);
+                char answer = 'n';
+                if (std::scanf(" %c", &answer) == 1 && (answer == 'y' || answer == 'Y')) {
+                    // proceed to read
+                } else {
+                    return std::nullopt;
+                }
+            } else {
+                logger.log(LogLevel::Warn, "File too large (>%dKB): %s", fileSizeLimit / 1000, filename.c_str());
+                return std::nullopt;
+            }
         }
 
         std::string content(static_cast<size_t>(fileSize), '\0');
@@ -240,7 +258,22 @@ public:
         return content;
     }
 
-    static std::string processFileReferences(const std::string &input, Logger &logger) {
+    static bool writeSecureFile(const std::string &path, const std::string &content, Logger &logger) {
+        int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd == -1) {
+            logger.log(LogLevel::Error, "Failed to open file for secure writing: %s", path.c_str());
+            return false;
+        }
+        ssize_t written = ::write(fd, content.data(), content.size());
+        ::close(fd);
+        if (written < 0 || static_cast<size_t>(written) != content.size()) {
+            logger.log(LogLevel::Error, "Failed to write to file: %s", path.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    static std::string processFileReferences(const std::string &input, Logger &logger, int fileSizeLimit = 10000, bool interactive = false) {
         if (input.empty()) return {};
 
         std::string result = input;
@@ -307,12 +340,12 @@ public:
             std::string replacement;
 
             if (access(filename.c_str(), F_OK) == 0 && isPlainTextFile(filename, logger)) {
-                auto contentOpt = readFileContent(filename, logger);
+                auto contentOpt = readFileContent(filename, logger, fileSizeLimit, interactive);
                 if (contentOpt.has_value()) {
                     replacement = prefix + "\nFile: " + filename + "\n```\n" + *contentOpt + "\n```" + suffix;
                     logger.log(LogLevel::Info, "Attached file content: %s (%zu bytes)", filename.c_str(), contentOpt->size());
                 } else {
-                    replacement = prefix + "[Error: Could not read " + filename + "]" + suffix;
+                    replacement = prefix + "[Skipped: " + filename + " (too large)]" + suffix;
                 }
             } else {
                 logger.log(LogLevel::Warn, "File not found or not plain text: %s", filename.c_str());
@@ -489,16 +522,22 @@ public:
         return false;
     }
 
-    void sendChat(CURL *curl, std::vector<Message> &messages, double temperature, bool noStream, int tokenLimit) {
+    std::string sendChat(CURL *curl, std::vector<Message> &messages, double temperature, bool noStream, int tokenLimit, bool rawMode = false) {
         if (messages.empty()) {
             logger_.log(LogLevel::Warn, "No messages to send to API");
-            return;
+            return {};
         }
 
         logger_.log(LogLevel::Info, "Sending request (model: %s, temp: %.2f, stream: %s)", settings_.model.c_str(), temperature, noStream ? "disabled" : "enabled");
 
+        size_t droppedCount = 0;
         while (messages.size() > 1 && countTokens(messages, settings_.model) + 100 > tokenLimit) {
             messages.erase(messages.begin() + 1);
+            ++droppedCount;
+        }
+        if (droppedCount > 0) {
+            std::fprintf(stderr, "Warning: dropped %zu message(s) to fit within token limit.\n", droppedCount);
+            logger_.log(LogLevel::Debug, "Dropped %zu messages (token counting is approximate)", droppedCount);
         }
 
         cJSON *root = cJSON_CreateObject();
@@ -516,7 +555,8 @@ public:
         cJSON_AddItemToObject(root, "messages", messageArray);
 
         char *jsonStr = cJSON_Print(root);
-        logger_.log(LogLevel::Debug, "Request JSON: %s", jsonStr);
+        logger_.log(LogLevel::Debug, "Request: model=%s, messages=%zu, temperature=%.2f, stream=%s",
+            settings_.model.c_str(), messages.size(), temperature, noStream ? "false" : "true");
 
         struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
@@ -527,9 +567,9 @@ public:
         }
 
         int attempt = 0;
-        bool done = false;
+        std::string result;
 
-        while (!done && attempt <= MAX_RETRIES) {
+        while (attempt <= MAX_RETRIES) {
             attempt++;
             logger_.log(LogLevel::Info, "Attempt %d/%d", attempt, MAX_RETRIES + 1);
 
@@ -538,10 +578,14 @@ public:
 
             ResponseBuffer buffer;
             buffer.streamEnabled = !noStream;
+            buffer.rawMode = rawMode;
             buffer.firstTokenFlag = &firstTokenReceived;
             buffer.logger = &logger_;
 
-            std::thread spinnerThread(spinnerLoop, std::ref(spinnerStop), std::ref(firstTokenReceived));
+            std::thread spinnerThread;
+            if (!rawMode) {
+                spinnerThread = std::thread(spinnerLoop, std::ref(spinnerStop), std::ref(firstTokenReceived));
+            }
 
             curl_easy_reset(curl);
             curl_easy_setopt(curl, CURLOPT_URL, "https://api.openai.com/v1/chat/completions");
@@ -558,9 +602,7 @@ public:
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
             spinnerStop.store(true);
-            if (spinnerThread.joinable()) {
-                spinnerThread.join();
-            }
+            if (spinnerThread.joinable()) spinnerThread.join();
 
             if (res != CURLE_OK) {
                 logger_.log(LogLevel::Error, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
@@ -577,23 +619,26 @@ public:
                 if (httpCode >= 400) {
                     printApiError(httpCode, buffer.data);
                 } else if (noStream) {
-                    printCompletionContent(buffer.data);
+                    buffer.responseContent = extractAndPrintContent(buffer.data);
                 } else {
                     if (!buffer.sawStreamData && !buffer.data.empty()) {
-                        if (!printCompletionContent(buffer.data)) {
+                        buffer.responseContent = extractAndPrintContent(buffer.data);
+                        if (buffer.responseContent.empty()) {
                             printApiError(httpCode, buffer.data);
                         }
                     }
-                    std::cout << std::endl;
+                    if (!rawMode) std::cout << std::endl;
                 }
             }
 
-            done = true;
+            result = buffer.responseContent;
+            break;
         }
 
         curl_slist_free_all(headers);
         cJSON_Delete(root);
         std::free(jsonStr);
+        return result;
     }
 
 private:
@@ -624,7 +669,8 @@ private:
                             if (delta) {
                                 cJSON *content = cJSON_GetObjectItem(delta, "content");
                                 if (content && cJSON_IsString(content) && content->valuestring) {
-                                    if (!buffer->sawStreamData) {
+                                    buffer->responseContent += content->valuestring;
+                                    if (!buffer->sawStreamData && !buffer->rawMode) {
                                         std::cout << "\n";
                                     }
                                     std::cout << content->valuestring;
@@ -749,13 +795,13 @@ private:
         }
     }
 
-    static bool printCompletionContent(const std::string &body) {
+    static std::string extractAndPrintContent(const std::string &body, bool print = true) {
         cJSON *json = cJSON_Parse(body.c_str());
         if (!json) {
-            return false;
+            return {};
         }
 
-        bool printed = false;
+        std::string result;
         cJSON *choices = cJSON_GetObjectItem(json, "choices");
         if (choices && cJSON_IsArray(choices) && cJSON_GetArraySize(choices) > 0) {
             cJSON *choice = cJSON_GetArrayItem(choices, 0);
@@ -763,13 +809,15 @@ private:
             if (message) {
                 cJSON *content = cJSON_GetObjectItem(message, "content");
                 if (content && cJSON_IsString(content) && content->valuestring) {
-                    std::cout << content->valuestring << "\n";
-                    printed = true;
+                    result = content->valuestring;
+                    if (print) {
+                        std::cout << result << "\n";
+                    }
                 }
             }
         }
         cJSON_Delete(json);
-        return printed;
+        return result;
     }
 
     static void printApiError(long httpCode, const std::string &body) {
@@ -845,11 +893,17 @@ private:
 struct ParseOutcome {
     bool continueMode{false};
     bool noStream{false};
+    bool rawMode{false};
     double temperature{1.0};
     std::string inputText;
     bool shouldExit{false};
     int exitCode{0};
 };
+
+std::string maskApiKey(const std::string &key) {
+    if (key.size() <= 8) return "****";
+    return key.substr(0, 5) + "..." + key.substr(key.size() - 4);
+}
 
 class Application {
 public:
@@ -876,6 +930,28 @@ public:
         if (!curlHandle_.valid()) {
             logger_.log(LogLevel::Error, "Failed to initialize curl");
             return 1;
+        }
+
+        // Stdin pipe support
+        if (!isatty(STDIN_FILENO)) {
+            std::string stdinData;
+            std::ostringstream ss;
+            ss << std::cin.rdbuf();
+            stdinData = ss.str();
+            // Trim trailing newline
+            while (!stdinData.empty() && (stdinData.back() == '\n' || stdinData.back() == '\r')) {
+                stdinData.pop_back();
+            }
+            if (!stdinData.empty()) {
+                if (outcome.inputText.empty()) {
+                    outcome.inputText = stdinData;
+                } else {
+                    outcome.inputText = stdinData + "\n\n" + outcome.inputText;
+                }
+            }
+            if (!outcome.rawMode) {
+                outcome.rawMode = true; // auto-enable raw mode for piped input
+            }
         }
 
         if (!outcome.continueMode && outcome.inputText.empty()) {
@@ -924,9 +1000,8 @@ private:
         if (settings_.apiKey.empty()) {
             logger_.log(LogLevel::Error, "API Key not found");
             if (access(".env", F_OK) != 0) {
-                std::ofstream envFile(".env");
-                if (envFile.is_open()) {
-                    envFile << "OPENAI_API_KEY=sk-xxxxxxxxxx\nASK_GLOBAL_MODEL=" << settings_.model << "\n";
+                std::string tmpl = "OPENAI_API_KEY=sk-xxxxxxxxxx\nASK_GLOBAL_MODEL=" + settings_.model + "\n";
+                if (FileUtil::writeSecureFile(".env", tmpl, logger_)) {
                     logger_.log(LogLevel::Info, "Created default .env file template");
                 } else {
                     logger_.log(LogLevel::Error, "Failed to create .env file");
@@ -962,26 +1037,33 @@ private:
     }
 
     void saveEnvFile() {
-        std::ofstream file(".env");
-        if (!file.is_open()) {
-            logger_.log(LogLevel::Error, "Failed to open .env file for writing");
+        std::string content = "OPENAI_API_KEY=" + settings_.apiKey + "\n"
+            + "ASK_GLOBAL_MODEL=" + settings_.model + "\n";
+        if (!FileUtil::writeSecureFile(".env", content, logger_)) {
+            logger_.log(LogLevel::Error, "Failed to save .env file");
             return;
         }
-        file << "OPENAI_API_KEY=" << settings_.apiKey << "\n";
-        file << "ASK_GLOBAL_MODEL=" << settings_.model << "\n";
         logger_.log(LogLevel::Info, "Saved API key and model settings to .env file");
     }
 
     void preParseLogging(int argc, char *argv[]) {
         for (int i = 1; i < argc; ++i) {
-            if (std::strcmp(argv[i], "--log") == 0 && i + 1 < argc) {
+            if (std::strcmp(argv[i], "--log") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --log requires a value\n");
+                    std::exit(1);
+                }
                 const char *level = argv[++i];
                 if (std::strcmp(level, "none") == 0) settings_.logLevel = LogLevel::None;
                 else if (std::strcmp(level, "error") == 0) settings_.logLevel = LogLevel::Error;
                 else if (std::strcmp(level, "warn") == 0) settings_.logLevel = LogLevel::Warn;
                 else if (std::strcmp(level, "info") == 0) settings_.logLevel = LogLevel::Info;
                 else if (std::strcmp(level, "debug") == 0) settings_.logLevel = LogLevel::Debug;
-            } else if (std::strcmp(argv[i], "--logfile") == 0 && i + 1 < argc) {
+            } else if (std::strcmp(argv[i], "--logfile") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --logfile requires a file path\n");
+                    std::exit(1);
+                }
                 settings_.logFilePath = argv[++i];
                 settings_.logToFile = true;
             } else if (std::strcmp(argv[i], "--debug") == 0) {
@@ -1030,25 +1112,115 @@ private:
                 outcome.noStream = true;
                 logger_.log(LogLevel::Debug, "Flag: streaming disabled");
             } else if (std::strcmp(argv[i], "--temperature") == 0 || std::strcmp(argv[i], "-T") == 0) {
-                if (i + 1 < argc) {
-                    outcome.temperature = std::atof(argv[++i]);
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --temperature requires a value\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+                {
+                    const char *tempArg = argv[++i];
+                    char *endptr = nullptr;
+                    outcome.temperature = std::strtod(tempArg, &endptr);
+                    if (endptr == tempArg || *endptr != '\0') {
+                        std::fprintf(stderr, "Error: invalid temperature value '%s'\n", tempArg);
+                        outcome.shouldExit = true;
+                        outcome.exitCode = 1;
+                        return outcome;
+                    }
+                    if (outcome.temperature < 0.0 || outcome.temperature > 2.0) {
+                        std::fprintf(stderr, "Error: temperature must be between 0.0 and 2.0 (got %.2f)\n", outcome.temperature);
+                        outcome.shouldExit = true;
+                        outcome.exitCode = 1;
+                        return outcome;
+                    }
                     logger_.log(LogLevel::Debug, "Set temperature to %.2f", outcome.temperature);
                 }
+            } else if (std::strcmp(argv[i], "--system") == 0 || std::strcmp(argv[i], "-s") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --system requires a prompt string\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+                settings_.systemPrompt = argv[++i];
+                logger_.log(LogLevel::Debug, "Set system prompt");
+            } else if (std::strcmp(argv[i], "--raw") == 0) {
+                outcome.rawMode = true;
+                logger_.log(LogLevel::Debug, "Flag: raw mode enabled");
             } else if (std::strcmp(argv[i], "--tokenLimit") == 0 || std::strcmp(argv[i], "-l") == 0) {
-                if (i + 1 < argc) {
-                    settings_.tokenLimit = std::atoi(argv[++i]);
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --tokenLimit requires a numeric value\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+                {
+                    const char *limitArg = argv[++i];
+                    char *endptr = nullptr;
+                    long val = std::strtol(limitArg, &endptr, 10);
+                    if (endptr == limitArg || *endptr != '\0') {
+                        std::fprintf(stderr, "Error: invalid token limit value '%s'\n", limitArg);
+                        outcome.shouldExit = true;
+                        outcome.exitCode = 1;
+                        return outcome;
+                    }
+                    if (val <= 0) {
+                        std::fprintf(stderr, "Error: token limit must be positive\n");
+                        outcome.shouldExit = true;
+                        outcome.exitCode = 1;
+                        return outcome;
+                    }
+                    settings_.tokenLimit = static_cast<int>(val);
                     logger_.log(LogLevel::Debug, "Set token limit to %d", settings_.tokenLimit);
                 }
+            } else if (std::strcmp(argv[i], "--fileLimit") == 0 || std::strcmp(argv[i], "-F") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --fileLimit requires a numeric value\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+                {
+                    const char *limitArg = argv[++i];
+                    char *endptr = nullptr;
+                    long val = std::strtol(limitArg, &endptr, 10);
+                    if (endptr == limitArg || *endptr != '\0') {
+                        std::fprintf(stderr, "Error: invalid file size limit value '%s'\n", limitArg);
+                        outcome.shouldExit = true;
+                        outcome.exitCode = 1;
+                        return outcome;
+                    }
+                    if (val <= 0) {
+                        std::fprintf(stderr, "Error: file size limit must be positive\n");
+                        outcome.shouldExit = true;
+                        outcome.exitCode = 1;
+                        return outcome;
+                    }
+                    settings_.fileSizeLimit = static_cast<int>(val);
+                    logger_.log(LogLevel::Debug, "Set file size limit to %d", settings_.fileSizeLimit);
+                }
             } else if (std::strcmp(argv[i], "--token") == 0 || std::strcmp(argv[i], "-t") == 0) {
-                if (i + 1 < argc) {
-                    settings_.apiKey = argv[++i];
-                    logger_.log(LogLevel::Debug, "Set API key from command line");
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --token requires an API key value\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
                 }
+                settings_.apiKey = argv[++i];
+                std::memset(argv[i], '*', std::strlen(argv[i]));
+                std::fprintf(stderr, "Warning: passing API key via --token exposes it in the process list.\n"
+                    "  Consider using OPENAI_API_KEY environment variable or --setAPIKey instead.\n");
+                logger_.log(LogLevel::Debug, "Set API key from command line");
             } else if (std::strcmp(argv[i], "--model") == 0 || std::strcmp(argv[i], "-m") == 0) {
-                if (i + 1 < argc) {
-                    settings_.model = argv[++i];
-                    logger_.log(LogLevel::Debug, "Set model to %s", settings_.model.c_str());
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --model requires a model name\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
                 }
+                settings_.model = argv[++i];
+                logger_.log(LogLevel::Debug, "Set model to %s", settings_.model.c_str());
             } else if (std::strcmp(argv[i], "--setAPIKey") == 0 && i + 1 < argc) {
                 newApiKey = argv[++i];
                 setApiKey = true;
@@ -1074,7 +1246,8 @@ private:
             if (setApiKey) settings_.apiKey = newApiKey;
             saveEnvFile();
             logger_.log(LogLevel::Info, "Updated configuration saved to .env file");
-            std::cout << "Remember to update to make sure your curl library can handle streaming\n";
+            if (setApiKey) std::cout << "API key saved to .env\n";
+            if (setModel) std::cout << "Model set to " << settings_.model << " and saved to .env\n";
             outcome.shouldExit = true;
             outcome.exitCode = 0;
             return outcome;
@@ -1083,7 +1256,7 @@ private:
         if (showVersion || settings_.debugMode) {
             std::cout << "OpenAI Chatbot\n";
             std::cout << "Model: " << settings_.model << "\n";
-            std::cout << "API Key: " << settings_.apiKey << "\n";
+            std::cout << "API Key: " << maskApiKey(settings_.apiKey) << "\n";
             std::cout << "Token Limit: " << settings_.tokenLimit << "\n";
 
             const char *levelStr = "UNKNOWN";
@@ -1131,10 +1304,13 @@ private:
         std::cout << "  -v, --version          Display version information\n";
         std::cout << "  -c, --continue         Enable conversation mode (supports multiple exchanges)\n";
         std::cout << "      --no-stream        Disable streaming output (wait for complete response)\n";
+        std::cout << "      --raw              Raw output mode (no spinner, minimal formatting)\n";
+        std::cout << "  -s, --system PROMPT    Set custom system prompt\n";
         std::cout << "  -t, --token TOKEN      Set OpenAI API token\n";
         std::cout << "  -m, --model MODEL      Set model to use (default: " << DEFAULT_MODEL << ")\n";
-        std::cout << "  -T, --temperature VAL  Set temperature (0.0-1.0, default: 1.0)\n";
+        std::cout << "  -T, --temperature VAL  Set temperature (0.0-2.0, default: 1.0)\n";
         std::cout << "  -l, --tokenLimit NUM   Set token limit (default: " << DEFAULT_TOKEN_LIMIT << ")\n";
+        std::cout << "  -F, --fileLimit NUM    Set @file size limit in bytes (default: 10000)\n";
         std::cout << "      --tokenCount       Count tokens in input text and exit\n";
         std::cout << "      --debug            Enable debug mode\n";
         std::cout << "      --log LEVEL        Set log level (none, error, warn, info, debug)\n";
@@ -1144,6 +1320,8 @@ private:
         std::cout << "Examples:\n";
         std::cout << "  ask \"What is the capital of France?\"\n";
         std::cout << "  ask -c \"Let's have a conversation\"\n";
+        std::cout << "  ask -s \"You are a pirate\" \"Hello there\"\n";
+        std::cout << "  echo \"some code\" | ask \"explain this\"\n";
         std::cout << "  ask --model gpt-4 --temperature 0.8 \"Write a poem about AI\"\n";
     }
 
@@ -1156,14 +1334,27 @@ private:
 
     void runConversation(const ParseOutcome &outcome) {
         logger_.log(LogLevel::Info, "Starting interactive mode");
+
+        if (!isatty(STDIN_FILENO)) {
+            std::fprintf(stderr, "Error: conversation mode is not supported with piped input.\n");
+            return;
+        }
+
+        std::string sysPrompt = settings_.systemPrompt.empty()
+            ? "You are a helpful assistant running in a command line interface. The user can chat with you and the conversation can be continued."
+            : settings_.systemPrompt;
+
         std::vector<Message> messages;
-        messages.push_back({"system", "You are a cute cat running in a command line interface. The user can chat with you and the conversation can be continued."});
+        messages.push_back({"system", sysPrompt});
 
         if (!outcome.inputText.empty()) {
-            std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_);
+            bool interactiveTty = isatty(STDIN_FILENO);
+            std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_, settings_.fileSizeLimit, interactiveTty);
             messages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
-            client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit);
-            messages.push_back({"assistant", "I'm a cute cat meow! (Note: In a full implementation, this would be the actual API response)"});
+            std::string response = client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
+            if (!response.empty()) {
+                messages.push_back({"assistant", response});
+            }
         } else {
             std::cout << "Starting conversation mode...\n";
         }
@@ -1201,21 +1392,29 @@ private:
                 continue;
             }
 
-            std::string processedInput = FileUtil::processFileReferences(userInput, logger_);
+            std::string processedInput = FileUtil::processFileReferences(userInput, logger_, settings_.fileSizeLimit, true);
             messages.push_back({"user", processedInput.empty() ? userInput : processedInput});
-            client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit);
-            messages.push_back({"assistant", "Meow response! (This would be the actual API response in a full implementation)"});
+            std::string response = client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
+            if (!response.empty()) {
+                messages.push_back({"assistant", response});
+            }
         }
     }
 
     void runSingle(const ParseOutcome &outcome) {
         logger_.log(LogLevel::Info, "Single response mode");
-        std::vector<Message> messages;
-        messages.push_back({"system", "You are a cute cat runs in a command line interface and you can only respond once to the user. Do not ask any questions in your response."});
 
-        std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_);
+        std::string sysPrompt = settings_.systemPrompt.empty()
+            ? "You are a helpful assistant running in a command line interface. Respond concisely to the user's query."
+            : settings_.systemPrompt;
+
+        std::vector<Message> messages;
+        messages.push_back({"system", sysPrompt});
+
+        bool interactiveTty = isatty(STDIN_FILENO);
+        std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_, settings_.fileSizeLimit, interactiveTty);
         messages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
-        client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit);
+        client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
     }
 
     ApiClient &client() {
