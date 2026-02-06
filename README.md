@@ -84,6 +84,13 @@ Raw output mode (no spinner, minimal formatting — useful for piping):
 ./ask --raw "Give me a JSON example" | jq .
 ```
 
+Follow-up on the last question without conversation mode:
+
+```bash
+./ask "how to list files recursively"
+./ask --context last "what about hidden files"
+```
+
 Attach text files inline using `@path`. The file content is injected directly into the prompt text — no vector storage or file uploads to OpenAI. Files over the size limit (default 10KB) trigger an interactive prompt in a terminal, or are silently skipped when piped:
 
 ```bash
@@ -98,6 +105,7 @@ Attach text files inline using `@path`. The file content is injected directly in
 | `-h`, `--help` | Display help message |
 | `-v`, `--version` | Display version information |
 | `-c`, `--continue` | Interactive conversation mode |
+| `--context last` | Prepend previous Q&A for lightweight follow-ups |
 | `--no-stream` | Disable SSE streaming (wait for full response) |
 | `--raw` | Raw output mode (no spinner, minimal formatting) |
 | `-s`, `--system PROMPT` | Set custom system prompt |

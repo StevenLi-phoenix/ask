@@ -34,6 +34,11 @@ constexpr time_t MODELS_CACHE_EXPIRY = 86400; // 24 hours
 constexpr long CONNECT_TIMEOUT = 10L;
 constexpr long REQUEST_TIMEOUT = 60L;
 constexpr int MAX_RETRIES = 1; // total attempts = MAX_RETRIES + 1
+constexpr const char *LAST_CONTEXT_FILE = "~/.cache/ask_last_context.json";
+constexpr const char *DEFAULT_SYSTEM_PROMPT =
+    "Terminal assistant. Give shortest answer with directly copyable commands. "
+    "No emoji, no filler. For errors: brief cause then fix. "
+    "Style: man page, not chatbot.";
 
 enum class LogLevel {
     None = 0,
@@ -485,6 +490,63 @@ private:
     ModelsCacheData data_{};
 };
 
+class ContextManager {
+public:
+    void save(const std::vector<Message> &messages, Logger &logger) {
+        cJSON *arr = cJSON_CreateArray();
+        if (!arr) return;
+        for (const auto &msg : messages) {
+            cJSON *obj = cJSON_CreateObject();
+            if (!obj) continue;
+            cJSON_AddStringToObject(obj, "role", msg.role.c_str());
+            cJSON_AddStringToObject(obj, "content", msg.content.c_str());
+            cJSON_AddItemToArray(arr, obj);
+        }
+        char *jsonStr = cJSON_Print(arr);
+        cJSON_Delete(arr);
+        if (!jsonStr) return;
+        std::string path = FileUtil::expandHomePath(LAST_CONTEXT_FILE, logger);
+        FileUtil::writeSecureFile(path, jsonStr, logger);
+        std::free(jsonStr);
+        logger.log(LogLevel::Debug, "Saved %zu messages to context file", messages.size());
+    }
+
+    std::vector<Message> load(Logger &logger) {
+        std::string path = FileUtil::expandHomePath(LAST_CONTEXT_FILE, logger);
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            logger.log(LogLevel::Debug, "No context file found");
+            return {};
+        }
+        std::stringstream buf;
+        buf << file.rdbuf();
+        std::string content = buf.str();
+        if (content.empty()) return {};
+
+        cJSON *arr = cJSON_Parse(content.c_str());
+        if (!arr || !cJSON_IsArray(arr)) {
+            if (arr) cJSON_Delete(arr);
+            logger.log(LogLevel::Warn, "Failed to parse context file");
+            return {};
+        }
+
+        std::vector<Message> messages;
+        int n = cJSON_GetArraySize(arr);
+        for (int i = 0; i < n; ++i) {
+            cJSON *obj = cJSON_GetArrayItem(arr, i);
+            if (!obj) continue;
+            cJSON *role = cJSON_GetObjectItem(obj, "role");
+            cJSON *cont = cJSON_GetObjectItem(obj, "content");
+            if (role && cJSON_IsString(role) && cont && cJSON_IsString(cont)) {
+                messages.push_back({role->valuestring, cont->valuestring});
+            }
+        }
+        cJSON_Delete(arr);
+        logger.log(LogLevel::Debug, "Loaded %zu messages from context file", messages.size());
+        return messages;
+    }
+};
+
 class CurlHandle {
 public:
     CurlHandle() : handle_(curl_easy_init()) {}
@@ -894,6 +956,7 @@ struct ParseOutcome {
     bool continueMode{false};
     bool noStream{false};
     bool rawMode{false};
+    bool contextLast{false};
     double temperature{1.0};
     std::string inputText;
     bool shouldExit{false};
@@ -925,6 +988,11 @@ public:
         ParseOutcome outcome = parseArguments(argc, argv);
         if (outcome.shouldExit) {
             return outcome.exitCode;
+        }
+
+        if (outcome.contextLast && outcome.continueMode) {
+            std::fprintf(stderr, "Error: --context last and --continue are mutually exclusive.\n");
+            return 1;
         }
 
         if (!curlHandle_.valid()) {
@@ -1148,6 +1216,23 @@ private:
             } else if (std::strcmp(argv[i], "--raw") == 0) {
                 outcome.rawMode = true;
                 logger_.log(LogLevel::Debug, "Flag: raw mode enabled");
+            } else if (std::strcmp(argv[i], "--context") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --context requires a value (supported: last)\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+                std::string val = argv[++i];
+                if (val == "last") {
+                    outcome.contextLast = true;
+                    logger_.log(LogLevel::Debug, "Flag: context last enabled");
+                } else {
+                    std::fprintf(stderr, "Error: unknown --context value '%s' (supported: last)\n", val.c_str());
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
             } else if (std::strcmp(argv[i], "--tokenLimit") == 0 || std::strcmp(argv[i], "-l") == 0) {
                 if (i + 1 >= argc) {
                     std::fprintf(stderr, "Error: --tokenLimit requires a numeric value\n");
@@ -1303,6 +1388,7 @@ private:
         std::cout << "  -h, --help             Display this help message\n";
         std::cout << "  -v, --version          Display version information\n";
         std::cout << "  -c, --continue         Enable conversation mode (supports multiple exchanges)\n";
+        std::cout << "      --context last     Prepend previous Q&A for lightweight follow-ups\n";
         std::cout << "      --no-stream        Disable streaming output (wait for complete response)\n";
         std::cout << "      --raw              Raw output mode (no spinner, minimal formatting)\n";
         std::cout << "  -s, --system PROMPT    Set custom system prompt\n";
@@ -1340,12 +1426,8 @@ private:
             return;
         }
 
-        std::string sysPrompt = settings_.systemPrompt.empty()
-            ? "You are a helpful assistant running in a command line interface. The user can chat with you and the conversation can be continued."
-            : settings_.systemPrompt;
-
         std::vector<Message> messages;
-        messages.push_back({"system", sysPrompt});
+        messages.push_back({"system", effectiveSystemPrompt()});
 
         if (!outcome.inputText.empty()) {
             bool interactiveTty = isatty(STDIN_FILENO);
@@ -1399,22 +1481,54 @@ private:
                 messages.push_back({"assistant", response});
             }
         }
+
+        // Save last exchange for --context last
+        if (messages.size() >= 3) {
+            std::vector<Message> lastExchange;
+            lastExchange.push_back(messages.front()); // system
+            lastExchange.push_back(messages[messages.size() - 2]); // last user
+            lastExchange.push_back(messages.back()); // last assistant
+            contextManager_.save(lastExchange, logger_);
+        }
     }
 
     void runSingle(const ParseOutcome &outcome) {
         logger_.log(LogLevel::Info, "Single response mode");
 
-        std::string sysPrompt = settings_.systemPrompt.empty()
-            ? "You are a helpful assistant running in a command line interface. Respond concisely to the user's query."
-            : settings_.systemPrompt;
-
         std::vector<Message> messages;
-        messages.push_back({"system", sysPrompt});
+        messages.push_back({"system", effectiveSystemPrompt()});
+
+        if (outcome.contextLast) {
+            auto prev = contextManager_.load(logger_);
+            if (prev.empty()) {
+                std::fprintf(stderr, "Warning: no previous context found. Running without context.\n");
+            } else {
+                for (auto &msg : prev) {
+                    if (msg.role != "system") {
+                        messages.push_back(std::move(msg));
+                    }
+                }
+            }
+        }
 
         bool interactiveTty = isatty(STDIN_FILENO);
         std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_, settings_.fileSizeLimit, interactiveTty);
         messages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
-        client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
+        std::string response = client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
+
+        if (!response.empty()) {
+            std::vector<Message> toSave;
+            toSave.push_back(messages.front()); // system
+            toSave.push_back(messages.back());  // user
+            toSave.push_back({"assistant", response});
+            contextManager_.save(toSave, logger_);
+        }
+    }
+
+    std::string effectiveSystemPrompt() const {
+        return settings_.systemPrompt.empty()
+            ? std::string(DEFAULT_SYSTEM_PROMPT)
+            : settings_.systemPrompt;
     }
 
     ApiClient &client() {
@@ -1427,6 +1541,7 @@ private:
     Settings settings_{};
     Logger logger_;
     ModelsCacheManager cacheManager_{};
+    ContextManager contextManager_{};
     CurlHandle curlHandle_{};
     std::optional<ApiClient> apiClient_{};
 };
