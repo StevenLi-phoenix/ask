@@ -1,12 +1,12 @@
 CXX      = g++
 CC       = gcc
-CXXFLAGS = -std=c++17 -Wall -Wextra
-CFLAGS   = -std=c11 -Wall -Wextra
+CXXFLAGS = -std=c++17 -O2 -DNDEBUG -Wall -Wextra
+CFLAGS   = -std=c11 -O2 -DNDEBUG -Wall -Wextra
 LDFLAGS  =
 LIBS     = -lcurl
 
 BIN = ask
-SRC = main.cpp
+SRC = ask.cpp
 CJSON_SRC = vendor/cjson/cJSON.c
 CJSON_OBJ = cJSON.o
 

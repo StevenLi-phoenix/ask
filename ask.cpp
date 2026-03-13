@@ -14,9 +14,11 @@
 #include <limits>
 #include <optional>
 #include <pwd.h>
+#include <signal.h>
 #include <sstream>
 #include <string>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -39,6 +41,62 @@ constexpr const char *DEFAULT_SYSTEM_PROMPT =
     "Terminal assistant. Give shortest answer with directly copyable commands. "
     "No emoji, no filler. For errors: brief cause then fix. "
     "Style: man page, not chatbot.";
+
+volatile sig_atomic_t g_shutdownSignal = 0;
+volatile sig_atomic_t g_requestInFlight = 0;
+std::atomic_bool g_interruptNoticePrinted{false};
+
+void resetSignalState() {
+    g_shutdownSignal = 0;
+    g_requestInFlight = 0;
+    g_interruptNoticePrinted.store(false);
+}
+
+bool shutdownRequested() {
+    return g_shutdownSignal != 0;
+}
+
+int interruptedExitCode() {
+    return shutdownRequested() ? 128 + g_shutdownSignal : 1;
+}
+
+void setRequestInFlight(bool inFlight) {
+    g_requestInFlight = inFlight ? 1 : 0;
+}
+
+void printInterruptNotice() {
+    bool expected = false;
+    if (g_interruptNoticePrinted.compare_exchange_strong(expected, true)) {
+        std::fprintf(stderr, "Interrupted.\n");
+    }
+}
+
+extern "C" void handleTerminationSignal(int signum) {
+    g_shutdownSignal = signum;
+
+    const char newline = '\n';
+    if (g_requestInFlight != 0) {
+        (void)::write(STDERR_FILENO, &newline, 1);
+    }
+}
+
+bool installSignalHandlers() {
+    struct sigaction action {};
+    action.sa_handler = handleTerminationSignal;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+
+    return sigaction(SIGINT, &action, nullptr) == 0 &&
+        sigaction(SIGTERM, &action, nullptr) == 0;
+}
+
+std::string detectOS() {
+    struct utsname info;
+    if (uname(&info) != 0) return "Unknown OS";
+    std::string sysname = info.sysname;
+    std::string os = (sysname == "Darwin") ? "macOS" : sysname;
+    return os + " " + info.sysname + " " + info.release + " " + info.machine;
+}
 
 enum class LogLevel {
     None = 0,
@@ -101,9 +159,12 @@ public:
         }
 
         std::time_t now = std::time(nullptr);
-        std::tm *localTime = std::localtime(&now);
+        std::tm localTime{};
+        if (localtime_r(&now, &localTime) == nullptr) {
+            std::memset(&localTime, 0, sizeof(localTime));
+        }
         char timeStr[20];
-        std::strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", localTime);
+        std::strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", &localTime);
 
         va_list args;
         va_start(args, format);
@@ -112,7 +173,7 @@ public:
         std::vsnprintf(message, sizeof(message), format, args);
 
         if (level <= LogLevel::Warn || debug_) {
-            std::fprintf(stdout, "[%s] %s: %s\n", timeStr, levelStr, message);
+            std::fprintf(stderr, "[%s] %s: %s\n", timeStr, levelStr, message);
         }
 
         if (logToFile_ && file_) {
@@ -151,7 +212,7 @@ private:
 
 struct Settings {
     std::string apiKey;
-    std::string model = DEFAULT_MODEL;
+    std::string model;
     std::string systemPrompt;
     int tokenLimit = DEFAULT_TOKEN_LIMIT;
     int fileSizeLimit = 10000;
@@ -244,10 +305,14 @@ public:
             if (interactive) {
                 std::fprintf(stderr, "File '%s' is %ldKB (limit: %dKB). Include anyway? [y/N]: ",
                     filename.c_str(), static_cast<long>(fileSize) / 1000, fileSizeLimit / 1000);
-                char answer = 'n';
-                if (std::scanf(" %c", &answer) == 1 && (answer == 'y' || answer == 'Y')) {
-                    // proceed to read
-                } else {
+                std::fflush(stderr);
+
+                std::string answer;
+                if (!std::getline(std::cin, answer)) {
+                    return std::nullopt;
+                }
+
+                if (answer.empty() || (answer[0] != 'y' && answer[0] != 'Y')) {
                     return std::nullopt;
                 }
             } else {
@@ -269,12 +334,17 @@ public:
             logger.log(LogLevel::Error, "Failed to open file for secure writing: %s", path.c_str());
             return false;
         }
-        ssize_t written = ::write(fd, content.data(), content.size());
-        ::close(fd);
-        if (written < 0 || static_cast<size_t>(written) != content.size()) {
-            logger.log(LogLevel::Error, "Failed to write to file: %s", path.c_str());
-            return false;
+        size_t totalWritten = 0;
+        while (totalWritten < content.size()) {
+            ssize_t written = ::write(fd, content.data() + totalWritten, content.size() - totalWritten);
+            if (written <= 0) {
+                ::close(fd);
+                logger.log(LogLevel::Error, "Failed to write to file: %s", path.c_str());
+                return false;
+            }
+            totalWritten += static_cast<size_t>(written);
         }
+        ::close(fd);
         return true;
     }
 
@@ -377,9 +447,17 @@ public:
             return false;
         }
 
-        std::stringstream buffer;
-        buffer << cacheFile.rdbuf();
-        std::string content = buffer.str();
+        cacheFile.seekg(0, std::ios::end);
+        std::streampos fileSize = cacheFile.tellg();
+        cacheFile.seekg(0, std::ios::beg);
+        if (fileSize <= 0) {
+            logger.log(LogLevel::Warn, "Empty models cache file");
+            return false;
+        }
+
+        std::string content(static_cast<size_t>(fileSize), '\0');
+        cacheFile.read(content.data(), fileSize);
+        content.resize(static_cast<size_t>(cacheFile.gcount()));
 
         if (content.empty()) {
             logger.log(LogLevel::Warn, "Empty models cache file");
@@ -416,6 +494,7 @@ public:
 
         data_.models.clear();
         int modelCount = cJSON_GetArraySize(modelsArray);
+        data_.models.reserve(static_cast<size_t>(modelCount));
         for (int i = 0; i < modelCount; ++i) {
             cJSON *model = cJSON_GetArrayItem(modelsArray, i);
             if (!model || !cJSON_IsObject(model)) continue;
@@ -461,7 +540,7 @@ public:
             cJSON_AddItemToArray(modelsArray, node);
         }
 
-        char *jsonStr = cJSON_Print(root);
+        char *jsonStr = cJSON_PrintUnformatted(root);
         if (!jsonStr) {
             logger.log(LogLevel::Error, "Failed to print JSON for cache");
             cJSON_Delete(root);
@@ -502,7 +581,7 @@ public:
             cJSON_AddStringToObject(obj, "content", msg.content.c_str());
             cJSON_AddItemToArray(arr, obj);
         }
-        char *jsonStr = cJSON_Print(arr);
+        char *jsonStr = cJSON_PrintUnformatted(arr);
         cJSON_Delete(arr);
         if (!jsonStr) return;
         std::string path = FileUtil::expandHomePath(LAST_CONTEXT_FILE, logger);
@@ -518,9 +597,14 @@ public:
             logger.log(LogLevel::Debug, "No context file found");
             return {};
         }
-        std::stringstream buf;
-        buf << file.rdbuf();
-        std::string content = buf.str();
+        file.seekg(0, std::ios::end);
+        std::streampos fileSize = file.tellg();
+        file.seekg(0, std::ios::beg);
+        if (fileSize <= 0) return {};
+
+        std::string content(static_cast<size_t>(fileSize), '\0');
+        file.read(content.data(), fileSize);
+        content.resize(static_cast<size_t>(file.gcount()));
         if (content.empty()) return {};
 
         cJSON *arr = cJSON_Parse(content.c_str());
@@ -532,6 +616,7 @@ public:
 
         std::vector<Message> messages;
         int n = cJSON_GetArraySize(arr);
+        messages.reserve(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
             cJSON *obj = cJSON_GetArrayItem(arr, i);
             if (!obj) continue;
@@ -568,6 +653,9 @@ public:
         bool cacheLoaded = cache_.load(logger_);
         if (!cacheLoaded || cache_.data().models.empty()) {
             if (!fetchModelsList(curl)) {
+                if (shutdownRequested()) {
+                    return false;
+                }
                 logger_.log(LogLevel::Warn, "Failed to fetch models list, continuing without validation");
                 return true;
             }
@@ -590,33 +678,50 @@ public:
             return {};
         }
 
+        if (shutdownRequested()) {
+            return {};
+        }
+
         logger_.log(LogLevel::Info, "Sending request (model: %s, temp: %.2f, stream: %s)", settings_.model.c_str(), temperature, noStream ? "disabled" : "enabled");
 
-        size_t droppedCount = 0;
-        while (messages.size() > 1 && countTokens(messages, settings_.model) + 100 > tokenLimit) {
-            messages.erase(messages.begin() + 1);
-            ++droppedCount;
-        }
-        if (droppedCount > 0) {
-            std::fprintf(stderr, "Warning: dropped %zu message(s) to fit within token limit.\n", droppedCount);
-            logger_.log(LogLevel::Debug, "Dropped %zu messages (token counting is approximate)", droppedCount);
+        if (!trimMessagesToTokenLimit(messages, tokenLimit)) {
+            return {};
         }
 
         cJSON *root = cJSON_CreateObject();
+        if (!root) {
+            logger_.log(LogLevel::Error, "Failed to allocate request JSON object");
+            return {};
+        }
         cJSON_AddStringToObject(root, "model", settings_.model.c_str());
         cJSON_AddNumberToObject(root, "temperature", temperature);
         cJSON_AddBoolToObject(root, "stream", !noStream);
 
         cJSON *messageArray = cJSON_CreateArray();
+        if (!messageArray) {
+            logger_.log(LogLevel::Error, "Failed to allocate request messages array");
+            cJSON_Delete(root);
+            return {};
+        }
         for (const auto &msg : messages) {
             cJSON *message = cJSON_CreateObject();
+            if (!message) {
+                logger_.log(LogLevel::Error, "Failed to allocate request message object");
+                cJSON_Delete(root);
+                return {};
+            }
             cJSON_AddStringToObject(message, "role", msg.role.c_str());
             cJSON_AddStringToObject(message, "content", msg.content.c_str());
             cJSON_AddItemToArray(messageArray, message);
         }
         cJSON_AddItemToObject(root, "messages", messageArray);
 
-        char *jsonStr = cJSON_Print(root);
+        char *jsonStr = cJSON_PrintUnformatted(root);
+        if (!jsonStr) {
+            logger_.log(LogLevel::Error, "Failed to serialize request JSON");
+            cJSON_Delete(root);
+            return {};
+        }
         logger_.log(LogLevel::Debug, "Request: model=%s, messages=%zu, temperature=%.2f, stream=%s",
             settings_.model.c_str(), messages.size(), temperature, noStream ? "false" : "true");
 
@@ -655,11 +760,16 @@ public:
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonStr);
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transferAbortCallback);
+            curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
             curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT);
             curl_easy_setopt(curl, CURLOPT_TIMEOUT, REQUEST_TIMEOUT);
 
             logger_.log(LogLevel::Info, "Sending request to API...");
+            setRequestInFlight(true);
             CURLcode res = curl_easy_perform(curl);
+            setRequestInFlight(false);
             long httpCode = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
@@ -667,6 +777,13 @@ public:
             if (spinnerThread.joinable()) spinnerThread.join();
 
             if (res != CURLE_OK) {
+                if (res == CURLE_ABORTED_BY_CALLBACK && shutdownRequested()) {
+                    logger_.log(LogLevel::Warn, "Request interrupted by signal");
+                    printInterruptNotice();
+                    result.clear();
+                    break;
+                }
+
                 logger_.log(LogLevel::Error, "curl_easy_perform() failed: %s", curl_easy_strerror(res));
                 bool shouldRetry = (res == CURLE_OPERATION_TIMEDOUT) && attempt <= MAX_RETRIES;
                 if (shouldRetry) {
@@ -704,6 +821,10 @@ public:
     }
 
 private:
+    static int transferAbortCallback(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+        return shutdownRequested() ? 1 : 0;
+    }
+
     static size_t writeCallback(void *contents, size_t size, size_t nmemb, void *userp) {
         size_t realSize = size * nmemb;
         auto *buffer = static_cast<ResponseBuffer *>(userp);
@@ -775,9 +896,21 @@ private:
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transferAbortCallback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, nullptr);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, CONNECT_TIMEOUT);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, REQUEST_TIMEOUT);
 
+        setRequestInFlight(true);
         CURLcode res = curl_easy_perform(curl);
+        setRequestInFlight(false);
         if (res != CURLE_OK) {
+            if (res == CURLE_ABORTED_BY_CALLBACK && shutdownRequested()) {
+                logger_.log(LogLevel::Warn, "Model fetch interrupted by signal");
+                curl_slist_free_all(headers);
+                return false;
+            }
             logger_.log(LogLevel::Error, "Failed to fetch models: %s", curl_easy_strerror(res));
             curl_slist_free_all(headers);
             return false;
@@ -903,14 +1036,51 @@ public:
         (void)model;
         int tokens = 3;
         for (const auto &message : messages) {
-            tokens += 3;
-            tokens += static_cast<int>(message.content.size()) / 4;
-            if (!message.role.empty()) tokens += 1;
+            tokens += countMessageTokens(message);
         }
         return tokens;
     }
 
 private:
+    static int countMessageTokens(const Message &message) {
+        int tokens = 3;
+        tokens += static_cast<int>(message.content.size()) / 4;
+        if (!message.role.empty()) tokens += 1;
+        return tokens;
+    }
+
+    bool trimMessagesToTokenLimit(std::vector<Message> &messages, int tokenLimit) {
+        int tokenCount = countTokens(messages, settings_.model) + 100;
+        size_t droppedCount = 0;
+        while (tokenCount > tokenLimit) {
+            if (messages.size() <= 2) {
+                logger_.log(LogLevel::Error, "Prompt exceeds token limit even after dropping history");
+                std::fprintf(stderr, "Error: prompt exceeds token limit. Shorten the input or increase --tokenLimit.\n");
+                return false;
+            }
+
+            size_t eraseCount = 1;
+            if (messages.size() > 3 &&
+                messages[1].role == "user" &&
+                messages[2].role == "assistant") {
+                eraseCount = 2;
+            }
+
+            for (size_t i = 1; i < 1 + eraseCount; ++i) {
+                tokenCount -= countMessageTokens(messages[i]);
+            }
+            messages.erase(messages.begin() + 1, messages.begin() + 1 + eraseCount);
+            droppedCount += eraseCount;
+        }
+
+        if (droppedCount > 0) {
+            std::fprintf(stderr, "Warning: dropped %zu message(s) to fit within token limit.\n", droppedCount);
+            logger_.log(LogLevel::Debug, "Dropped %zu messages (token counting is approximate)", droppedCount);
+        }
+
+        return true;
+    }
+
     static int levenshteinDistance(const std::string &s1, const std::string &s2) {
         size_t len1 = s1.size();
         size_t len2 = s2.size();
@@ -936,6 +1106,10 @@ private:
         size_t idx = 0;
         std::cout << "thinking... " << std::flush;
         while (!stopFlag.load()) {
+            if (shutdownRequested()) {
+                std::cout << std::endl << std::flush;
+                return;
+            }
             if (firstTokenFlag.load()) {
                 std::cout << "\n" << std::flush; // newline to separate spinner from response output
                 return;
@@ -957,6 +1131,7 @@ struct ParseOutcome {
     bool noStream{false};
     bool rawMode{false};
     bool contextLast{false};
+    bool tokenCountOnly{false};
     double temperature{1.0};
     std::string inputText;
     bool shouldExit{false};
@@ -979,6 +1154,8 @@ public:
     }
 
     int run(int argc, char *argv[]) {
+        resetSignalState();
+
         // Pre-pass for logging flags
         preParseLogging(argc, argv);
         logger_.configure(settings_.logLevel, settings_.debugMode, settings_.logToFile, settings_.logFilePath);
@@ -997,6 +1174,12 @@ public:
 
         if (!curlHandle_.valid()) {
             logger_.log(LogLevel::Error, "Failed to initialize curl");
+            return 1;
+        }
+
+        if (!installSignalHandlers()) {
+            logger_.log(LogLevel::Error, "Failed to install signal handlers");
+            std::fprintf(stderr, "Error: failed to install signal handlers.\n");
             return 1;
         }
 
@@ -1022,6 +1205,25 @@ public:
             }
         }
 
+        if (shutdownRequested()) {
+            printInterruptNotice();
+            return interruptedExitCode();
+        }
+
+        if (outcome.tokenCountOnly) {
+            if (outcome.inputText.empty()) {
+                std::fprintf(stderr, "Error: --tokenCount requires input text or piped stdin.\n");
+                return 1;
+            }
+
+            std::vector<Message> messages;
+            messages.push_back({"user", outcome.inputText});
+            int tokenCount = ApiClient::countTokens(messages, settings_.model);
+            std::cout << tokenCount << "\n";
+            logger_.log(LogLevel::Info, "Token count: %d", tokenCount);
+            return 0;
+        }
+
         if (!outcome.continueMode && outcome.inputText.empty()) {
             logger_.log(LogLevel::Info, "No input text provided, showing usage hint");
             printUsageHint();
@@ -1030,6 +1232,10 @@ public:
 
         // Validate model
         if (!client().validateModel(curlHandle_.get(), settings_.model)) {
+            if (shutdownRequested()) {
+                printInterruptNotice();
+                return interruptedExitCode();
+            }
             logger_.log(LogLevel::Error, "Invalid model: %s", settings_.model.c_str());
             std::printf("Error: '%s' is not a valid model.\n", settings_.model.c_str());
             return 1;
@@ -1039,6 +1245,10 @@ public:
             runConversation(outcome);
         } else {
             runSingle(outcome);
+        }
+
+        if (shutdownRequested()) {
+            return interruptedExitCode();
         }
 
         logger_.log(LogLevel::Info, "Exiting normally");
@@ -1063,18 +1273,6 @@ private:
         if (settings_.model.empty()) {
             settings_.model = DEFAULT_MODEL;
             logger_.log(LogLevel::Info, "Using default model: %s", DEFAULT_MODEL);
-        }
-
-        if (settings_.apiKey.empty()) {
-            logger_.log(LogLevel::Error, "API Key not found");
-            if (access(".env", F_OK) != 0) {
-                std::string tmpl = "OPENAI_API_KEY=sk-xxxxxxxxxx\nASK_GLOBAL_MODEL=" + settings_.model + "\n";
-                if (FileUtil::writeSecureFile(".env", tmpl, logger_)) {
-                    logger_.log(LogLevel::Info, "Created default .env file template");
-                } else {
-                    logger_.log(LogLevel::Error, "Failed to create .env file");
-                }
-            }
         }
     }
 
@@ -1114,6 +1312,17 @@ private:
         logger_.log(LogLevel::Info, "Saved API key and model settings to .env file");
     }
 
+    static bool parseLogLevel(const char *level, LogLevel &outLevel) {
+        if (std::strcmp(level, "none") == 0) outLevel = LogLevel::None;
+        else if (std::strcmp(level, "error") == 0) outLevel = LogLevel::Error;
+        else if (std::strcmp(level, "warn") == 0) outLevel = LogLevel::Warn;
+        else if (std::strcmp(level, "info") == 0) outLevel = LogLevel::Info;
+        else if (std::strcmp(level, "debug") == 0) outLevel = LogLevel::Debug;
+        else return false;
+
+        return true;
+    }
+
     void preParseLogging(int argc, char *argv[]) {
         for (int i = 1; i < argc; ++i) {
             if (std::strcmp(argv[i], "--log") == 0) {
@@ -1122,11 +1331,10 @@ private:
                     std::exit(1);
                 }
                 const char *level = argv[++i];
-                if (std::strcmp(level, "none") == 0) settings_.logLevel = LogLevel::None;
-                else if (std::strcmp(level, "error") == 0) settings_.logLevel = LogLevel::Error;
-                else if (std::strcmp(level, "warn") == 0) settings_.logLevel = LogLevel::Warn;
-                else if (std::strcmp(level, "info") == 0) settings_.logLevel = LogLevel::Info;
-                else if (std::strcmp(level, "debug") == 0) settings_.logLevel = LogLevel::Debug;
+                if (!parseLogLevel(level, settings_.logLevel)) {
+                    std::fprintf(stderr, "Error: invalid log level '%s' (expected: none, error, warn, info, debug)\n", level);
+                    std::exit(1);
+                }
             } else if (std::strcmp(argv[i], "--logfile") == 0) {
                 if (i + 1 >= argc) {
                     std::fprintf(stderr, "Error: --logfile requires a file path\n");
@@ -1173,6 +1381,37 @@ private:
             } else if (std::strcmp(argv[i], "--tokenCount") == 0) {
                 showTokenCount = true;
                 logger_.log(LogLevel::Debug, "Flag: show token count");
+            } else if (std::strcmp(argv[i], "--debug") == 0) {
+                settings_.debugMode = true;
+                settings_.logLevel = LogLevel::Debug;
+                logger_.log(LogLevel::Debug, "Flag: debug mode enabled");
+            } else if (std::strcmp(argv[i], "--log") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --log requires a value\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+
+                const char *level = argv[++i];
+                if (!parseLogLevel(level, settings_.logLevel)) {
+                    std::fprintf(stderr, "Error: invalid log level '%s' (expected: none, error, warn, info, debug)\n", level);
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+                logger_.log(LogLevel::Debug, "Set log level from command line");
+            } else if (std::strcmp(argv[i], "--logfile") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --logfile requires a file path\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
+
+                settings_.logFilePath = argv[++i];
+                settings_.logToFile = true;
+                logger_.log(LogLevel::Debug, "Set logfile path to %s", settings_.logFilePath.c_str());
             } else if (std::strcmp(argv[i], "--continue") == 0 || std::strcmp(argv[i], "-c") == 0) {
                 outcome.continueMode = true;
                 logger_.log(LogLevel::Debug, "Flag: continue mode enabled");
@@ -1306,11 +1545,23 @@ private:
                 }
                 settings_.model = argv[++i];
                 logger_.log(LogLevel::Debug, "Set model to %s", settings_.model.c_str());
-            } else if (std::strcmp(argv[i], "--setAPIKey") == 0 && i + 1 < argc) {
+            } else if (std::strcmp(argv[i], "--setAPIKey") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --setAPIKey requires an API key value\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
                 newApiKey = argv[++i];
                 setApiKey = true;
                 logger_.log(LogLevel::Debug, "Will save new API key");
-            } else if (std::strcmp(argv[i], "--setModel") == 0 && i + 1 < argc) {
+            } else if (std::strcmp(argv[i], "--setModel") == 0) {
+                if (i + 1 >= argc) {
+                    std::fprintf(stderr, "Error: --setModel requires a model name\n");
+                    outcome.shouldExit = true;
+                    outcome.exitCode = 1;
+                    return outcome;
+                }
                 newModel = argv[++i];
                 setModel = true;
                 logger_.log(LogLevel::Debug, "Will save new model: %s", newModel.c_str());
@@ -1361,18 +1612,9 @@ private:
             }
         }
 
-        if (showTokenCount && !outcome.inputText.empty()) {
-            std::vector<Message> messages;
-            messages.push_back({"user", outcome.inputText});
-            int tokenCount = ApiClient::countTokens(messages, settings_.model);
-            std::cout << tokenCount << "\n";
-            logger_.log(LogLevel::Info, "Token count: %d", tokenCount);
-            outcome.shouldExit = true;
-            outcome.exitCode = 0;
-            return outcome;
-        }
+        outcome.tokenCountOnly = showTokenCount;
 
-        if (settings_.apiKey.empty()) {
+        if (settings_.apiKey.empty() && !outcome.tokenCountOnly) {
             std::fprintf(stderr, "API Key not found. Set OPENAI_API_KEY or use --setAPIKey.\n");
             outcome.shouldExit = true;
             outcome.exitCode = 1;
@@ -1432,10 +1674,19 @@ private:
         if (!outcome.inputText.empty()) {
             bool interactiveTty = isatty(STDIN_FILENO);
             std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_, settings_.fileSizeLimit, interactiveTty);
-            messages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
-            std::string response = client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
+            if (shutdownRequested()) {
+                printInterruptNotice();
+                return;
+            }
+            std::vector<Message> requestMessages = messages;
+            requestMessages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
+            std::string response = client().sendChat(curlHandle_.get(), requestMessages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
             if (!response.empty()) {
-                messages.push_back({"assistant", response});
+                requestMessages.push_back({"assistant", response});
+                messages = std::move(requestMessages);
+            }
+            if (shutdownRequested()) {
+                return;
             }
         } else {
             std::cout << "Starting conversation mode...\n";
@@ -1445,11 +1696,20 @@ private:
 
         std::string userInput;
         while (true) {
+            if (shutdownRequested()) {
+                printInterruptNotice();
+                break;
+            }
+
             std::cout << "> ";
             std::cout.flush();
 
             if (!std::getline(std::cin, userInput)) {
-                logger_.log(LogLevel::Warn, "Failed to read user input, exiting");
+                if (shutdownRequested()) {
+                    printInterruptNotice();
+                } else {
+                    logger_.log(LogLevel::Warn, "Failed to read user input, exiting");
+                }
                 break;
             }
 
@@ -1475,20 +1735,26 @@ private:
             }
 
             std::string processedInput = FileUtil::processFileReferences(userInput, logger_, settings_.fileSizeLimit, true);
-            messages.push_back({"user", processedInput.empty() ? userInput : processedInput});
-            std::string response = client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
+            if (shutdownRequested()) {
+                printInterruptNotice();
+                break;
+            }
+            std::vector<Message> requestMessages = messages;
+            requestMessages.push_back({"user", processedInput.empty() ? userInput : processedInput});
+            std::string response = client().sendChat(curlHandle_.get(), requestMessages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
             if (!response.empty()) {
-                messages.push_back({"assistant", response});
+                requestMessages.push_back({"assistant", response});
+                messages = std::move(requestMessages);
+            }
+            if (shutdownRequested()) {
+                break;
             }
         }
 
         // Save last exchange for --context last
-        if (messages.size() >= 3) {
-            std::vector<Message> lastExchange;
-            lastExchange.push_back(messages.front()); // system
-            lastExchange.push_back(messages[messages.size() - 2]); // last user
-            lastExchange.push_back(messages.back()); // last assistant
-            contextManager_.save(lastExchange, logger_);
+        auto lastExchange = findLastCompleteExchange(messages);
+        if (lastExchange.has_value()) {
+            contextManager_.save(*lastExchange, logger_);
         }
     }
 
@@ -1513,22 +1779,42 @@ private:
 
         bool interactiveTty = isatty(STDIN_FILENO);
         std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_, settings_.fileSizeLimit, interactiveTty);
-        messages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
-        std::string response = client().sendChat(curlHandle_.get(), messages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
+        if (shutdownRequested()) {
+            printInterruptNotice();
+            return;
+        }
+        std::vector<Message> requestMessages = messages;
+        requestMessages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
+        std::string response = client().sendChat(curlHandle_.get(), requestMessages, outcome.temperature, outcome.noStream, settings_.tokenLimit, outcome.rawMode);
 
-        if (!response.empty()) {
+        if (!response.empty() && !shutdownRequested()) {
             std::vector<Message> toSave;
-            toSave.push_back(messages.front()); // system
-            toSave.push_back(messages.back());  // user
+            toSave.push_back(requestMessages.front()); // system
+            toSave.push_back(requestMessages.back());  // user
             toSave.push_back({"assistant", response});
             contextManager_.save(toSave, logger_);
         }
     }
 
+    std::optional<std::vector<Message>> findLastCompleteExchange(const std::vector<Message> &messages) const {
+        if (messages.size() < 3) {
+            return std::nullopt;
+        }
+
+        for (size_t i = messages.size() - 1; i > 0; --i) {
+            if (messages[i].role == "assistant" && messages[i - 1].role == "user") {
+                return std::vector<Message>{messages.front(), messages[i - 1], messages[i]};
+            }
+        }
+
+        return std::nullopt;
+    }
+
     std::string effectiveSystemPrompt() const {
-        return settings_.systemPrompt.empty()
+        std::string base = settings_.systemPrompt.empty()
             ? std::string(DEFAULT_SYSTEM_PROMPT)
             : settings_.systemPrompt;
+        return base + " OS: " + detectOS() + ".";
     }
 
     ApiClient &client() {

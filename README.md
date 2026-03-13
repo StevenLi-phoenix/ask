@@ -27,7 +27,7 @@ sudo apt-get install -y g++ libcurl4-openssl-dev
 make
 ```
 
-This produces the `ask` binary.
+This produces the `ask` binary from `ask.cpp`.
 
 ## Configure API key / model
 
@@ -95,7 +95,7 @@ Attach text files inline using `@path`. The file content is injected directly in
 
 ```bash
 ./ask "Summarize @README.md"
-./ask --fileLimit 50000 "Explain @largefile.cpp"   # raise limit to 50KB
+./ask --fileLimit 50000 "Explain @ask.cpp"         # raise limit to 50KB
 ```
 
 ## Flags
