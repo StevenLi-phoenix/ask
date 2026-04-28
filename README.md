@@ -6,7 +6,7 @@
 
 `ask` is a lightweight CLI that sends chat prompts to OpenAI. It runs as a single C++17 binary (libcurl + vendored cJSON) and supports both one-shot replies and interactive chat.
 
-- Default model: `gpt-5.3-chat-latest` (always resolves to the latest GPT-5.3 chat release)
+- Default model: `gpt-5.5` (GPT-5.5 — latest flagship model for coding and professional work)
 - Default temperature: `1.0`
 - Default token limit: `128000`
 
@@ -37,20 +37,20 @@ You must provide `OPENAI_API_KEY` (and optionally `ASK_GLOBAL_MODEL`):
 
 ```bash
 export OPENAI_API_KEY=sk-...
-export ASK_GLOBAL_MODEL=gpt-5.3-chat-latest
+export ASK_GLOBAL_MODEL=gpt-5.5
 ```
 
 Or write a `.env`:
 
 ```
 OPENAI_API_KEY=sk-...
-ASK_GLOBAL_MODEL=gpt-5.3-chat-latest
+ASK_GLOBAL_MODEL=gpt-5.5
 ```
 
 Or persist via flags (writes `.env`):
 
 ```bash
-./ask --setAPIKey sk-... --setModel gpt-5.3-chat-latest
+./ask --setAPIKey sk-... --setModel gpt-5.5
 ```
 
 ## Usage
@@ -112,7 +112,7 @@ Attach text files inline using `@path`. The file content is injected directly in
 | `--raw` | Raw output mode (no spinner, minimal formatting) |
 | `-s`, `--system PROMPT` | Set custom system prompt |
 | `-t`, `--token TOKEN` | API key for this run |
-| `-m`, `--model MODEL` | Model for this run (default: `gpt-5.3-chat-latest`) |
+| `-m`, `--model MODEL` | Model for this run (default: `gpt-5.5`) |
 | `-T`, `--temperature VAL` | Sampling temperature, 0.0–2.0 (default: 1.0) |
 | `-l`, `--tokenLimit NUM` | Max tokens budget (default: 128000) |
 | `-F`, `--fileLimit NUM` | `@file` size limit in bytes (default: 10000) |
