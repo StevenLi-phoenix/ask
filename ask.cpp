@@ -28,7 +28,8 @@
 
 namespace {
 
-constexpr const char *DEFAULT_MODEL = "gpt-5.2-chat-latest";
+constexpr const char *DEFAULT_MODEL = "gpt-5.5";
+constexpr const char *DEFAULT_REASONING_EFFORT = "none";
 constexpr size_t MAX_BUFFER_SIZE = 8192;
 constexpr int DEFAULT_TOKEN_LIMIT = 128000;
 constexpr const char *MODELS_CACHE_FILE = "~/.cache/ask_models_cache.json";
@@ -694,6 +695,7 @@ public:
             return {};
         }
         cJSON_AddStringToObject(root, "model", settings_.model.c_str());
+        cJSON_AddStringToObject(root, "reasoning_effort", DEFAULT_REASONING_EFFORT);
         cJSON_AddNumberToObject(root, "temperature", temperature);
         cJSON_AddBoolToObject(root, "stream", !noStream);
 
@@ -986,7 +988,7 @@ private:
             std::printf("Model '%s' not found. Did you mean '%s'?\n", invalidModel.c_str(), closestModel.c_str());
             logger_.log(LogLevel::Info, "Suggested alternative model: %s (distance: %d)", closestModel.c_str(), minDistance);
         } else {
-            std::printf("Model '%s' not found. Available models include: gpt-4o, gpt-4o-mini, gpt-3.5-turbo\n", invalidModel.c_str());
+            std::printf("Model '%s' not found. Available models include: gpt-5.5, gpt-5.3-chat-latest, gpt-5.4\n", invalidModel.c_str());
         }
     }
 
@@ -1650,7 +1652,7 @@ private:
         std::cout << "  ask -c \"Let's have a conversation\"\n";
         std::cout << "  ask -s \"You are a pirate\" \"Hello there\"\n";
         std::cout << "  echo \"some code\" | ask \"explain this\"\n";
-        std::cout << "  ask --model gpt-4 --temperature 0.8 \"Write a poem about AI\"\n";
+        std::cout << "  ask --model gpt-5.5 --temperature 0.8 \"Write a poem about AI\"\n";
     }
 
     void printUsageHint() {
