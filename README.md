@@ -94,6 +94,23 @@ Follow-up on the last question without conversation mode:
 ./ask --context last "what about hidden files"
 ```
 
+Translate a request into a shell command and run it (`-x`). The model is given a `run_shell_command` tool (OpenAI tool calling), so the command comes back as structured arguments rather than text to copy out of a reply. `ask` shows the command and asks before running it:
+
+```bash
+$ ./ask -x "iptables show all rules"
+# List all iptables rules with counters, numeric output and line numbers.
+$ sudo iptables -L -v -n --line-numbers
+Run it? [y/N]: y
+Chain INPUT (policy ACCEPT 0 packets, 0 bytes)
+...
+```
+
+- The command runs through `/bin/sh -c`; `ask` exits with the command's exit code.
+- `-y` / `--yes` skips the confirmation. The model writes the command, so only use it for requests you would be comfortable running blind.
+- `--dry-run` prints just the command to stdout without running it, e.g. `cmd=$(ask -x --dry-run "show listening ports")`. The same happens whenever stdin is not a terminal and `--yes` is not given, since there is nothing to ask on.
+- If no shell command fits the request, the model's reply is printed to stderr and nothing runs.
+- Not combinable with `-c` or `--context`.
+
 Attach text files inline using `@path`. The file content is injected directly into the prompt text — no vector storage or file uploads to OpenAI. Files over the size limit (default 10KB) trigger an interactive prompt in a terminal, or are silently skipped when piped:
 
 ```bash
@@ -109,6 +126,9 @@ Attach text files inline using `@path`. The file content is injected directly in
 | `-v`, `--version` | Display version information |
 | `-c`, `--continue` | Interactive conversation mode |
 | `--context last` | Prepend previous Q&A for lightweight follow-ups |
+| `-x`, `--exec` | Translate the request into a shell command (tool call), confirm, then run it |
+| `-y`, `--yes` | With `--exec`: run the command without asking first |
+| `--dry-run` | With `--exec`: print the command to stdout, do not run it |
 | `--no-stream` | Disable SSE streaming (wait for full response) |
 | `--raw` | Raw output mode (no spinner, minimal formatting) |
 | `-s`, `--system PROMPT` | Set custom system prompt |

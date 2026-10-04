@@ -19,6 +19,7 @@
 #include <string>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
 #include <vector>
@@ -42,6 +43,34 @@ constexpr const char *DEFAULT_SYSTEM_PROMPT =
     "Terminal assistant. Give shortest answer with directly copyable commands. "
     "No emoji, no filler. For errors: brief cause then fix. "
     "Style: man page, not chatbot.";
+constexpr const char *COMMAND_SYSTEM_PROMPT =
+    "Shell command translator. Turn the user's request into exactly one shell command "
+    "by calling run_shell_command. The command runs via /bin/sh -c, so use POSIX sh syntax. "
+    "For requests that only inspect state, use read-only forms with flags that make the output "
+    "complete and readable (numeric, verbose, line numbers). Use sudo only when root is required. "
+    "If no shell command can fulfil the request, reply with one short sentence and do not call the tool.";
+constexpr const char *COMMAND_TOOL_NAME = "run_shell_command";
+constexpr const char *COMMAND_TOOLS_JSON = R"([{
+  "type": "function",
+  "function": {
+    "name": "run_shell_command",
+    "description": "Run one shell command on the user's machine, after the user approves it.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "description": "The complete shell command line, ready to run with /bin/sh -c."
+        },
+        "explanation": {
+          "type": "string",
+          "description": "One short sentence (under 100 characters) saying what the command does."
+        }
+      },
+      "required": ["command"]
+    }
+  }
+}])";
 
 volatile sig_atomic_t g_shutdownSignal = 0;
 volatile sig_atomic_t g_requestInFlight = 0;
@@ -130,6 +159,20 @@ struct ResponseBuffer {
     bool rawMode{false};
     std::atomic_bool *firstTokenFlag{nullptr};
     class Logger *logger{nullptr};
+};
+
+enum class RequestStatus {
+    Ok,          // HTTP exchange completed (the status code may still be an error)
+    Failed,      // transport error, already reported to the user
+    Interrupted  // aborted by SIGINT/SIGTERM
+};
+
+// What the model answered in command mode: a tool call, plain text, or nothing usable.
+struct CommandSuggestion {
+    bool ok{false};
+    std::string command;
+    std::string explanation;
+    std::string text;
 };
 
 class Logger {
@@ -689,6 +732,85 @@ public:
             return {};
         }
 
+        std::string body = buildChatRequest(messages, temperature, !noStream, false);
+        if (body.empty()) {
+            return {};
+        }
+
+        ResponseBuffer buffer;
+        long httpCode = 0;
+        RequestStatus status = performRequest(curl, body, noStream, rawMode, buffer, httpCode);
+        if (status == RequestStatus::Interrupted) {
+            return {};
+        }
+
+        if (status == RequestStatus::Ok) {
+            logger_.log(LogLevel::Info, "Request completed successfully");
+            logger_.log(LogLevel::Debug, "Response size: %zu bytes", buffer.data.size());
+            if (httpCode >= 400) {
+                printApiError(httpCode, buffer.data);
+            } else if (noStream) {
+                buffer.responseContent = extractAndPrintContent(buffer.data);
+            } else {
+                if (!buffer.sawStreamData && !buffer.data.empty()) {
+                    buffer.responseContent = extractAndPrintContent(buffer.data);
+                    if (buffer.responseContent.empty()) {
+                        printApiError(httpCode, buffer.data);
+                    }
+                }
+                if (!rawMode) std::cout << std::endl;
+            }
+        }
+
+        return buffer.responseContent;
+    }
+
+    // Command mode: offer the model a run_shell_command tool and read the command back
+    // from the structured tool call instead of scraping it out of free text.
+    CommandSuggestion requestCommand(CURL *curl, std::vector<Message> &messages, double temperature, int tokenLimit, bool rawMode) {
+        CommandSuggestion suggestion;
+        if (messages.empty() || shutdownRequested()) {
+            return suggestion;
+        }
+
+        logger_.log(LogLevel::Info, "Sending command request (model: %s, temp: %.2f)", settings_.model.c_str(), temperature);
+
+        if (!trimMessagesToTokenLimit(messages, tokenLimit)) {
+            return suggestion;
+        }
+
+        std::string body = buildChatRequest(messages, temperature, false, true);
+        if (body.empty()) {
+            return suggestion;
+        }
+
+        ResponseBuffer buffer;
+        long httpCode = 0;
+        if (performRequest(curl, body, true, rawMode, buffer, httpCode) != RequestStatus::Ok) {
+            return suggestion;
+        }
+
+        if (httpCode >= 400) {
+            printApiError(httpCode, buffer.data);
+            return suggestion;
+        }
+        if (!parseCommandResponse(buffer.data, suggestion)) {
+            logger_.log(LogLevel::Error, "Unexpected response body: %s", buffer.data.c_str());
+            std::fprintf(stderr, "Error: unexpected response from API.\n");
+            return suggestion;
+        }
+
+        suggestion.ok = true;
+        return suggestion;
+    }
+
+private:
+    static int transferAbortCallback(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+        return shutdownRequested() ? 1 : 0;
+    }
+
+    // Serializes a chat completion request. Returns an empty string on failure.
+    std::string buildChatRequest(const std::vector<Message> &messages, double temperature, bool stream, bool withTools) {
         cJSON *root = cJSON_CreateObject();
         if (!root) {
             logger_.log(LogLevel::Error, "Failed to allocate request JSON object");
@@ -697,7 +819,7 @@ public:
         cJSON_AddStringToObject(root, "model", settings_.model.c_str());
         cJSON_AddStringToObject(root, "reasoning_effort", DEFAULT_REASONING_EFFORT);
         cJSON_AddNumberToObject(root, "temperature", temperature);
-        cJSON_AddBoolToObject(root, "stream", !noStream);
+        cJSON_AddBoolToObject(root, "stream", stream);
 
         cJSON *messageArray = cJSON_CreateArray();
         if (!messageArray) {
@@ -709,6 +831,7 @@ public:
             cJSON *message = cJSON_CreateObject();
             if (!message) {
                 logger_.log(LogLevel::Error, "Failed to allocate request message object");
+                cJSON_Delete(messageArray);
                 cJSON_Delete(root);
                 return {};
             }
@@ -718,15 +841,32 @@ public:
         }
         cJSON_AddItemToObject(root, "messages", messageArray);
 
+        if (withTools) {
+            cJSON *tools = cJSON_Parse(COMMAND_TOOLS_JSON);
+            if (!tools) {
+                logger_.log(LogLevel::Error, "Failed to build tool definitions");
+                cJSON_Delete(root);
+                return {};
+            }
+            cJSON_AddItemToObject(root, "tools", tools);
+        }
+
         char *jsonStr = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
         if (!jsonStr) {
             logger_.log(LogLevel::Error, "Failed to serialize request JSON");
-            cJSON_Delete(root);
             return {};
         }
-        logger_.log(LogLevel::Debug, "Request: model=%s, messages=%zu, temperature=%.2f, stream=%s",
-            settings_.model.c_str(), messages.size(), temperature, noStream ? "false" : "true");
+        std::string body = jsonStr;
+        std::free(jsonStr);
+        logger_.log(LogLevel::Debug, "Request: model=%s, messages=%zu, temperature=%.2f, stream=%s, tools=%s",
+            settings_.model.c_str(), messages.size(), temperature, stream ? "true" : "false", withTools ? "true" : "false");
+        return body;
+    }
 
+    // POSTs the request body to the chat completions endpoint (with one retry on timeout),
+    // showing the spinner unless rawMode is set. The final attempt's response lands in `result`.
+    RequestStatus performRequest(CURL *curl, const std::string &body, bool noStream, bool rawMode, ResponseBuffer &result, long &httpCode) {
         struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
         std::string authHeader = "Authorization: Bearer " + settings_.apiKey;
@@ -735,8 +875,8 @@ public:
             headers = curl_slist_append(headers, "Accept: text/event-stream");
         }
 
+        RequestStatus status = RequestStatus::Failed;
         int attempt = 0;
-        std::string result;
 
         while (attempt <= MAX_RETRIES) {
             attempt++;
@@ -759,7 +899,7 @@ public:
             curl_easy_reset(curl);
             curl_easy_setopt(curl, CURLOPT_URL, "https://api.openai.com/v1/chat/completions");
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, jsonStr);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
             curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
@@ -772,7 +912,7 @@ public:
             setRequestInFlight(true);
             CURLcode res = curl_easy_perform(curl);
             setRequestInFlight(false);
-            long httpCode = 0;
+            httpCode = 0;
             curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
 
             spinnerStop.store(true);
@@ -782,7 +922,7 @@ public:
                 if (res == CURLE_ABORTED_BY_CALLBACK && shutdownRequested()) {
                     logger_.log(LogLevel::Warn, "Request interrupted by signal");
                     printInterruptNotice();
-                    result.clear();
+                    status = RequestStatus::Interrupted;
                     break;
                 }
 
@@ -795,36 +935,70 @@ public:
                     std::fprintf(stderr, "Request failed: %s\n", curl_easy_strerror(res));
                 }
             } else {
-                logger_.log(LogLevel::Info, "Request completed successfully");
-                logger_.log(LogLevel::Debug, "Response size: %zu bytes", buffer.data.size());
-                if (httpCode >= 400) {
-                    printApiError(httpCode, buffer.data);
-                } else if (noStream) {
-                    buffer.responseContent = extractAndPrintContent(buffer.data);
-                } else {
-                    if (!buffer.sawStreamData && !buffer.data.empty()) {
-                        buffer.responseContent = extractAndPrintContent(buffer.data);
-                        if (buffer.responseContent.empty()) {
-                            printApiError(httpCode, buffer.data);
-                        }
-                    }
-                    if (!rawMode) std::cout << std::endl;
-                }
+                status = RequestStatus::Ok;
             }
 
-            result = buffer.responseContent;
+            buffer.firstTokenFlag = nullptr; // points at this iteration's local
+            result = std::move(buffer);
             break;
         }
 
         curl_slist_free_all(headers);
-        cJSON_Delete(root);
-        std::free(jsonStr);
-        return result;
+        return status;
     }
 
-private:
-    static int transferAbortCallback(void *, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
-        return shutdownRequested() ? 1 : 0;
+    // Pulls the run_shell_command tool call (or, failing that, the plain-text reply) out of a
+    // non-streaming chat completion. Returns false if the body is not a usable completion.
+    static bool parseCommandResponse(const std::string &body, CommandSuggestion &out) {
+        cJSON *json = cJSON_Parse(body.c_str());
+        if (!json) {
+            return false;
+        }
+
+        bool parsed = false;
+        cJSON *choices = cJSON_GetObjectItem(json, "choices");
+        cJSON *choice = (choices && cJSON_IsArray(choices)) ? cJSON_GetArrayItem(choices, 0) : nullptr;
+        cJSON *message = choice ? cJSON_GetObjectItem(choice, "message") : nullptr;
+        if (message && cJSON_IsObject(message)) {
+            parsed = true;
+
+            cJSON *content = cJSON_GetObjectItem(message, "content");
+            if (content && cJSON_IsString(content) && content->valuestring) {
+                out.text = content->valuestring;
+            }
+
+            cJSON *toolCalls = cJSON_GetObjectItem(message, "tool_calls");
+            cJSON *call = nullptr;
+            cJSON_ArrayForEach(call, toolCalls) {
+                cJSON *function = cJSON_GetObjectItem(call, "function");
+                cJSON *name = function ? cJSON_GetObjectItem(function, "name") : nullptr;
+                cJSON *arguments = function ? cJSON_GetObjectItem(function, "arguments") : nullptr;
+                if (!name || !cJSON_IsString(name) || std::strcmp(name->valuestring, COMMAND_TOOL_NAME) != 0 ||
+                    !arguments || !cJSON_IsString(arguments)) {
+                    continue;
+                }
+
+                cJSON *args = cJSON_Parse(arguments->valuestring);
+                if (!args) {
+                    continue;
+                }
+                cJSON *command = cJSON_GetObjectItem(args, "command");
+                cJSON *explanation = cJSON_GetObjectItem(args, "explanation");
+                if (command && cJSON_IsString(command) && command->valuestring) {
+                    out.command = command->valuestring;
+                    if (explanation && cJSON_IsString(explanation) && explanation->valuestring) {
+                        out.explanation = explanation->valuestring;
+                    }
+                }
+                cJSON_Delete(args);
+                if (!out.command.empty()) {
+                    break;
+                }
+            }
+        }
+
+        cJSON_Delete(json);
+        return parsed;
     }
 
     static size_t writeCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -1133,6 +1307,9 @@ struct ParseOutcome {
     bool noStream{false};
     bool rawMode{false};
     bool contextLast{false};
+    bool commandMode{false};
+    bool autoYes{false};
+    bool dryRun{false};
     bool tokenCountOnly{false};
     double temperature{1.0};
     std::string inputText;
@@ -1171,6 +1348,21 @@ public:
 
         if (outcome.contextLast && outcome.continueMode) {
             std::fprintf(stderr, "Error: --context last and --continue are mutually exclusive.\n");
+            return 1;
+        }
+
+        if (outcome.commandMode && (outcome.continueMode || outcome.contextLast)) {
+            std::fprintf(stderr, "Error: --exec cannot be combined with --continue or --context.\n");
+            return 1;
+        }
+
+        if (!outcome.commandMode && (outcome.autoYes || outcome.dryRun)) {
+            std::fprintf(stderr, "Error: --yes and --dry-run only apply together with --exec.\n");
+            return 1;
+        }
+
+        if (outcome.autoYes && outcome.dryRun) {
+            std::fprintf(stderr, "Error: --yes and --dry-run are mutually exclusive.\n");
             return 1;
         }
 
@@ -1243,7 +1435,10 @@ public:
             return 1;
         }
 
-        if (outcome.continueMode) {
+        int exitCode = 0;
+        if (outcome.commandMode) {
+            exitCode = runCommandMode(outcome);
+        } else if (outcome.continueMode) {
             runConversation(outcome);
         } else {
             runSingle(outcome);
@@ -1254,7 +1449,7 @@ public:
         }
 
         logger_.log(LogLevel::Info, "Exiting normally");
-        return 0;
+        return exitCode;
     }
 
 private:
@@ -1417,6 +1612,15 @@ private:
             } else if (std::strcmp(argv[i], "--continue") == 0 || std::strcmp(argv[i], "-c") == 0) {
                 outcome.continueMode = true;
                 logger_.log(LogLevel::Debug, "Flag: continue mode enabled");
+            } else if (std::strcmp(argv[i], "--exec") == 0 || std::strcmp(argv[i], "-x") == 0) {
+                outcome.commandMode = true;
+                logger_.log(LogLevel::Debug, "Flag: command mode enabled");
+            } else if (std::strcmp(argv[i], "--yes") == 0 || std::strcmp(argv[i], "-y") == 0) {
+                outcome.autoYes = true;
+                logger_.log(LogLevel::Debug, "Flag: skip command confirmation");
+            } else if (std::strcmp(argv[i], "--dry-run") == 0) {
+                outcome.dryRun = true;
+                logger_.log(LogLevel::Debug, "Flag: dry run");
             } else if (std::strcmp(argv[i], "--no-stream") == 0) {
                 outcome.noStream = true;
                 logger_.log(LogLevel::Debug, "Flag: streaming disabled");
@@ -1633,6 +1837,9 @@ private:
         std::cout << "  -v, --version          Display version information\n";
         std::cout << "  -c, --continue         Enable conversation mode (supports multiple exchanges)\n";
         std::cout << "      --context last     Prepend previous Q&A for lightweight follow-ups\n";
+        std::cout << "  -x, --exec             Translate the request into a shell command, confirm, then run it\n";
+        std::cout << "  -y, --yes              With --exec: run the command without asking first\n";
+        std::cout << "      --dry-run          With --exec: print the command to stdout, do not run it\n";
         std::cout << "      --no-stream        Disable streaming output (wait for complete response)\n";
         std::cout << "      --raw              Raw output mode (no spinner, minimal formatting)\n";
         std::cout << "  -s, --system PROMPT    Set custom system prompt\n";
@@ -1652,6 +1859,7 @@ private:
         std::cout << "  ask -c \"Let's have a conversation\"\n";
         std::cout << "  ask -s \"You are a pirate\" \"Hello there\"\n";
         std::cout << "  echo \"some code\" | ask \"explain this\"\n";
+        std::cout << "  ask -x \"iptables show all rules\"\n";
         std::cout << "  ask --model gpt-5.5 --temperature 0.8 \"Write a poem about AI\"\n";
     }
 
@@ -1798,6 +2006,92 @@ private:
         }
     }
 
+    // Translates the request into a shell command through a tool call, then (after the user
+    // approves it) runs it. Returns the exit code ask itself should end with.
+    int runCommandMode(const ParseOutcome &outcome) {
+        logger_.log(LogLevel::Info, "Command mode");
+
+        const bool interactiveTty = isatty(STDIN_FILENO);
+        std::string processedInput = FileUtil::processFileReferences(outcome.inputText, logger_, settings_.fileSizeLimit, interactiveTty);
+        if (shutdownRequested()) {
+            printInterruptNotice();
+            return 1;
+        }
+
+        std::vector<Message> messages;
+        messages.push_back({"system", commandSystemPrompt()});
+        messages.push_back({"user", processedInput.empty() ? outcome.inputText : processedInput});
+
+        // Keep the spinner off when stdout is captured, e.g. cmd=$(ask -x --dry-run ...).
+        const bool quiet = outcome.rawMode || !isatty(STDOUT_FILENO);
+        CommandSuggestion suggestion = client().requestCommand(curlHandle_.get(), messages, outcome.temperature, settings_.tokenLimit, quiet);
+        if (shutdownRequested()) {
+            return 1;
+        }
+        if (!suggestion.ok) {
+            return 1;
+        }
+
+        const std::string command = trimWhitespace(suggestion.command);
+        if (command.empty()) {
+            if (suggestion.text.empty()) {
+                std::fprintf(stderr, "Error: the model did not return a command.\n");
+            } else {
+                std::fprintf(stderr, "%s\n", suggestion.text.c_str());
+            }
+            return 1;
+        }
+
+        if (!suggestion.explanation.empty() && !outcome.rawMode) {
+            std::fprintf(stderr, "# %s\n", suggestion.explanation.c_str());
+        }
+
+        // Without a terminal to ask on, or when asked to, only print the command.
+        if (outcome.dryRun || (!interactiveTty && !outcome.autoYes)) {
+            std::cout << command << "\n";
+            return 0;
+        }
+
+        std::fprintf(stderr, "$ %s\n", command.c_str());
+        if (!outcome.autoYes) {
+            std::fprintf(stderr, "Run it? [y/N]: ");
+            std::fflush(stderr);
+
+            std::string answer;
+            if (!std::getline(std::cin, answer)) {
+                if (shutdownRequested()) {
+                    printInterruptNotice();
+                } else {
+                    std::fprintf(stderr, "\n"); // EOF (Ctrl-D): end the prompt line
+                }
+                return 1;
+            }
+            if (answer.empty() || (answer[0] != 'y' && answer[0] != 'Y')) {
+                std::fprintf(stderr, "Not run.\n");
+                return 1;
+            }
+        }
+
+        std::cout.flush();
+        std::fflush(nullptr);
+        logger_.log(LogLevel::Info, "Running command: %s", command.c_str());
+        int status = std::system(command.c_str()); // via /bin/sh -c; ignores SIGINT here so Ctrl-C only stops the command
+        if (status == -1) {
+            std::fprintf(stderr, "Error: failed to run command: %s\n", std::strerror(errno));
+            return 127;
+        }
+        if (WIFEXITED(status)) return WEXITSTATUS(status);
+        if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
+        return 1;
+    }
+
+    static std::string trimWhitespace(const std::string &text) {
+        size_t first = text.find_first_not_of(" \t\r\n");
+        if (first == std::string::npos) return {};
+        size_t last = text.find_last_not_of(" \t\r\n");
+        return text.substr(first, last - first + 1);
+    }
+
     std::optional<std::vector<Message>> findLastCompleteExchange(const std::vector<Message> &messages) const {
         if (messages.size() < 3) {
             return std::nullopt;
@@ -1817,6 +2111,14 @@ private:
             ? std::string(DEFAULT_SYSTEM_PROMPT)
             : settings_.systemPrompt;
         return base + " OS: " + detectOS() + ".";
+    }
+
+    std::string commandSystemPrompt() const {
+        std::string prompt = COMMAND_SYSTEM_PROMPT;
+        if (!settings_.systemPrompt.empty()) {
+            prompt += " Additional instructions: " + settings_.systemPrompt;
+        }
+        return prompt + " OS: " + detectOS() + ".";
     }
 
     ApiClient &client() {
