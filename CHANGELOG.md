@@ -5,7 +5,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-15
+
 ### Added
+- `-x` / `--exec`: turn a request into a shell command via tool calling, confirm, then run it; `-y` skips the confirmation and `--dry-run` only prints the command.
 - Anthropic (`claude-haiku-5-5`) and DeepSeek (`deepseek-flash`) next to OpenAI. `-m openai` / `-m claude` / `-m deepseek` (also `haiku`, `flash`, `anthropic`) pick a provider's default; `claude-*` and `deepseek*` ids are routed to their provider automatically. Each provider reads its own key (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `DEEPSEEK_API_KEY`) from the environment or `.env`.
 - `ASK_BASE_URL` (environment or `.env`) to point the selected provider at any OpenAI-compatible endpoint.
 - `ASK_MODEL_KEY` (environment or `.env`): one API key for whichever provider or gateway is selected; overrides the provider's own key variable, `-t` overrides it.
