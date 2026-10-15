@@ -1,12 +1,10 @@
 """Unit tests for scripts/update_default_models.py (no network)."""
 import dataclasses
 import importlib.util
-import json
 import pathlib
 import socketserver
 import threading
 import unittest
-import urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -27,9 +25,20 @@ stale
 outro
 """
 
+CURRENT = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5", "deepseek": "deepseek-flash"}
+
 
 def by_name(name):
     return next(p for p in udm.PROVIDERS if p.name == name)
+
+
+class Extract(unittest.TestCase):
+    def test_model_ids_come_out_of_markdown_html_and_prose(self):
+        text = ('Use [GPT-6 Luna](/api/docs/models/gpt-6-luna) or `gpt-6.1-luna`. Older: '
+                'claude-haiku-4-5-20251001, "deepseek-flash"&quot; and claude-haiku-5-5.')
+        ids = udm.extract_ids(text)
+        for want in ("gpt-6-luna", "gpt-6.1-luna", "claude-haiku-4-5-20251001", "deepseek-flash", "claude-haiku-5-5"):
+            self.assertIn(want, ids)
 
 
 class PickLatest(unittest.TestCase):
@@ -54,47 +63,49 @@ class PickLatest(unittest.TestCase):
 
 class Rewrite(unittest.TestCase):
     def test_read_defaults(self):
-        self.assertEqual(udm.read_defaults(HEADER), {
-            "openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5", "deepseek": "deepseek-flash"})
+        self.assertEqual(udm.read_defaults(HEADER), CURRENT)
 
     def test_write_changes_only_what_changed_and_is_idempotent(self):
-        new = {"openai": "gpt-6.1-luna", "anthropic": "claude-haiku-5-5", "deepseek": "deepseek-flash"}
+        new = dict(CURRENT, openai="gpt-6.1-luna")
         out = udm.write_defaults(HEADER, new)
         self.assertIn('OPENAI_DEFAULT_MODEL = "gpt-6.1-luna"', out)
         self.assertIn('ANTHROPIC_DEFAULT_MODEL = "claude-haiku-5-5"', out)
         self.assertEqual(udm.write_defaults(out, new), out)
 
     def test_readme_block_replaced_in_place(self):
-        defaults = {"openai": "gpt-6.1-luna", "anthropic": "claude-haiku-5-5", "deepseek": "deepseek-flash"}
-        out = udm.update_readme(README, defaults)
+        out = udm.update_readme(README, dict(CURRENT, openai="gpt-6.1-luna"))
         self.assertTrue(out.startswith("intro\n<!-- BEGIN DEFAULT_MODELS -->"))
         self.assertTrue(out.endswith("<!-- END DEFAULT_MODELS -->\noutro\n"))
         self.assertIn("`gpt-6.1-luna`", out)
         self.assertNotIn("stale", out)
-        self.assertEqual(udm.update_readme(out, defaults), out)
+        self.assertEqual(udm.update_readme(out, dict(CURRENT, openai="gpt-6.1-luna")), out)
 
 
 class Resolve(unittest.TestCase):
-    def test_missing_key_skips_provider_and_keeps_current(self):
-        current = {"openai": "gpt-6-luna", "anthropic": "claude-haiku-5-5", "deepseek": "deepseek-flash"}
-        seen = []
+    PAGES = {"openai": "[Luna](/m/gpt-6-luna) [Luna 6.1](/m/gpt-6.1-luna) gpt-6-astra",
+             "anthropic": "claude-haiku-5-5 claude-haiku-4-5-20251001",
+             "deepseek": "model deepseek-flash deepseek-v4-pro"}
 
-        def fake_fetch(provider, key):
-            seen.append(provider.name)
-            return ["gpt-6.1-luna"]
+    def fetch(self, provider):
+        return udm.extract_ids(self.PAGES[provider.name])
 
-        new, notes = udm.resolve(current, {"OPENAI_API_KEY": "k"}, fake_fetch)
-        self.assertEqual(seen, ["openai"])
-        self.assertEqual(new["openai"], "gpt-6.1-luna")
-        self.assertEqual(new["anthropic"], "claude-haiku-5-5")
-        self.assertTrue(any("ANTHROPIC_API_KEY" in n for n in notes))
+    def test_every_provider_is_resolved_from_its_page(self):
+        new, notes = udm.resolve(CURRENT, self.fetch)
+        self.assertEqual(new, dict(CURRENT, openai="gpt-6.1-luna"))
+        self.assertTrue(any("gpt-6-luna -> gpt-6.1-luna" in n for n in notes))
+        self.assertTrue(any("claude-haiku-5-5 (unchanged)" in n for n in notes))
+
+    def test_page_without_a_match_is_an_error(self):
+        self.PAGES = dict(self.PAGES, anthropic="nothing useful here")
+        with self.assertRaises(udm.NoMatch):
+            udm.resolve(CURRENT, self.fetch)
 
     def test_fetch_failure_propagates(self):
-        def boom(provider, key):
-            raise udm.ProviderError("401")
+        def boom(provider):
+            raise udm.ProviderError("403")
 
         with self.assertRaises(udm.ProviderError):
-            udm.resolve({"openai": "x"}, {"OPENAI_API_KEY": "k"}, boom)
+            udm.resolve(CURRENT, boom)
 
 
 class QuickServer(HTTPServer):
@@ -107,15 +118,15 @@ class QuickServer(HTTPServer):
 
 
 class Fetch(unittest.TestCase):
-    """fetch_ids against a local server: auth header style per provider, parsing, error mapping."""
+    """fetch_ids against a local server: plain GET, no credentials, error mapping."""
 
-    def serve(self, status, payload):
+    def serve(self, status, body):
         seen = {}
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
                 seen["headers"] = {k.lower(): v for k, v in self.headers.items()}
-                out = json.dumps(payload).encode()
+                out = body.encode()
                 self.send_response(status)
                 self.send_header("Content-Length", str(len(out)))
                 self.end_headers()
@@ -128,29 +139,24 @@ class Fetch(unittest.TestCase):
         threading.Thread(target=server.serve_forever, daemon=True).start()
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
-        return f"http://127.0.0.1:{server.server_port}/v1/models", seen
+        return f"http://127.0.0.1:{server.server_port}/models.md", seen
 
-    def test_bearer_for_openai_style(self):
-        url, seen = self.serve(200, {"data": [{"id": "gpt-6-luna"}, {"id": "gpt-6-astra"}, {"nope": 1}]})
-        provider = dataclasses.replace(by_name("openai"), models_url=url)
-        self.assertEqual(udm.fetch_ids(provider, "sk-test"), ["gpt-6-luna", "gpt-6-astra"])
-        self.assertEqual(seen["headers"]["authorization"], "Bearer sk-test")
-
-    def test_x_api_key_for_anthropic(self):
-        url, seen = self.serve(200, {"data": [{"id": "claude-haiku-5-5"}]})
-        provider = dataclasses.replace(by_name("anthropic"), models_url=url)
-        self.assertEqual(udm.fetch_ids(provider, "sk-ant"), ["claude-haiku-5-5"])
-        self.assertEqual(seen["headers"]["x-api-key"], "sk-ant")
-        self.assertIn("anthropic-version", seen["headers"])
+    def test_reads_ids_from_the_public_page_without_credentials(self):
+        url, seen = self.serve(200, "# Models\n\nModel ID: `gpt-6-luna`, also gpt-6-astra.\n")
+        provider = dataclasses.replace(by_name("openai"), source_url=url)
+        ids = udm.fetch_ids(provider)
+        self.assertIn("gpt-6-luna", ids)
+        self.assertIn("gpt-6-astra", ids)
         self.assertNotIn("authorization", seen["headers"])
+        self.assertNotIn("x-api-key", seen["headers"])
+        self.assertIn("user-agent", seen["headers"])
 
-    def test_http_error_becomes_provider_error_without_leaking_the_key(self):
-        url, _ = self.serve(401, {"error": {"message": "bad key sk-test"}})
-        provider = dataclasses.replace(by_name("openai"), models_url=url)
+    def test_http_error_becomes_provider_error(self):
+        url, _ = self.serve(403, "blocked")
+        provider = dataclasses.replace(by_name("openai"), source_url=url)
         with self.assertRaises(udm.ProviderError) as ctx:
-            udm.fetch_ids(provider, "sk-test")
-        self.assertIn("401", str(ctx.exception))
-        self.assertNotIn("sk-test", str(ctx.exception))
+            udm.fetch_ids(provider)
+        self.assertIn("403", str(ctx.exception))
 
 
 if __name__ == "__main__":

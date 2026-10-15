@@ -183,16 +183,15 @@ Token counting is approximate. Streaming prints chunks as they arrive and falls 
 
 ## Default model updates
 
-`.github/workflows/update-default-models.yml` runs every Monday (and on demand). It lists the models each provider exposes, keeps the ones that match that provider's cheap-tier name pattern and takes the highest version (`scripts/update_default_models.py`, patterns in `PROVIDERS`). If anything changed it rewrites `default_models.h` and the table above, builds, runs the tests and opens a `chore: bump default models` PR.
+`.github/workflows/update-default-models.yml` runs every Monday (and on demand). `scripts/update_default_models.py` reads one public documentation page per provider, no API keys or secrets involved, keeps the model ids that match that provider's cheap-tier name pattern (`PROVIDERS` in the script) and takes the highest version. If anything changed it rewrites `default_models.h` and the table above, builds, runs the tests and opens a `chore: bump default models` PR.
 
-Setup, once:
+Setup, once: let Actions open pull requests.
 
 ```bash
-gh secret set OPENAI_API_KEY      # also ANTHROPIC_API_KEY, DEEPSEEK_API_KEY; a provider without a secret is skipped
 gh api -X PUT repos/<owner>/ask/actions/permissions/workflow -F can_approve_pull_request_reviews=true
 ```
 
-A provider with no model matching its pattern fails the run on purpose: the naming scheme changed and the pattern needs updating. Try it locally with `python3 scripts/update_default_models.py --dry-run`.
+A provider whose page no longer shows a matching model fails the run on purpose: the naming scheme or the page changed and the pattern needs updating. Try it locally with `python3 scripts/update_default_models.py --dry-run`.
 
 ## Tests
 

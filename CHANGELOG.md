@@ -5,6 +5,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+- The default-model updater reads each provider's public documentation page instead of calling authenticated model-list APIs, so the workflow needs no repository secrets.
+
 ## [1.4.0] - 2026-10-15
 
 ### Added

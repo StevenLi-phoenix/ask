@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """Bump the default models in default_models.h and the README table.
 
-For each provider the script lists the models its API exposes, keeps the ones that
-match the provider's "cheap tier" naming pattern (PROVIDERS below) and picks the
-highest version. A provider whose API key is not in the environment is skipped; a
-provider with no matching model is an error, because it means the naming scheme
-changed and the pattern needs a human.
+For each provider the script reads a public documentation page (no API key, no
+secret), pulls every model id out of its text, keeps the ones that match the
+provider's "cheap tier" naming pattern (PROVIDERS below) and picks the highest
+version. A provider with no matching model is an error, because it means the
+naming scheme or the page changed and the pattern needs a human.
 
 Stdlib only; deterministic; no LLM involved.
 """
 import argparse
-import json
 import os
 import pathlib
 import re
@@ -37,24 +36,23 @@ class Provider:
     name: str
     shortcuts: tuple
     const: str
-    key_env: str
-    models_url: str
+    key_env: str  # the variable `ask` reads for this provider (shown in the README table only)
+    source_url: str  # public page that names the provider's current models
     pattern: re.Pattern
-    anthropic_auth: bool = False
 
 
 # Patterns pick the cheap tier. When a provider renames its tiers, edit the pattern.
 PROVIDERS = (
     Provider("openai", ("openai",), "OPENAI_DEFAULT_MODEL", "OPENAI_API_KEY",
-             "https://api.openai.com/v1/models",
+             "https://developers.openai.com/api/docs/models.md",
              re.compile(r"^gpt-(\d+(?:\.\d+)*)-luna$")),
     # {1,2} digits per component keeps dated snapshots (claude-haiku-4-5-20251001) out.
     Provider("anthropic", ("claude", "haiku", "anthropic"), "ANTHROPIC_DEFAULT_MODEL", "ANTHROPIC_API_KEY",
-             "https://api.anthropic.com/v1/models?limit=1000",
-             re.compile(r"^claude-haiku-(\d{1,2}(?:-\d{1,2})?)$"), anthropic_auth=True),
+             "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+             re.compile(r"^claude-haiku-(\d{1,2}(?:-\d{1,2})?)$")),
     # DeepSeek ships a stable alias that always points at the latest Flash.
     Provider("deepseek", ("deepseek", "flash"), "DEEPSEEK_DEFAULT_MODEL", "DEEPSEEK_API_KEY",
-             "https://api.deepseek.com/models",
+             "https://api-docs.deepseek.com/",
              re.compile(r"^deepseek-flash$")),
 )
 
@@ -106,33 +104,30 @@ def update_readme(text, defaults):
     return text[:start + len(README_BEGIN)] + "\n" + render_readme_block(defaults) + "\n" + text[end:]
 
 
-def fetch_ids(provider, key):
-    headers = {"User-Agent": "ask-default-models-updater"}
-    if provider.anthropic_auth:
-        headers.update({"x-api-key": key, "anthropic-version": "2023-06-01"})
-    else:
-        headers["Authorization"] = f"Bearer {key}"
-    request = urllib.request.Request(provider.models_url, headers=headers)
+def extract_ids(text):
+    """Every model-id-shaped token in a page; the provider pattern decides which ones count."""
+    return {t.rstrip(".-_") for t in re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]*", text)}
+
+
+def fetch_ids(provider):
+    request = urllib.request.Request(provider.source_url, headers={
+        "User-Agent": "Mozilla/5.0 (compatible; ask-default-models-updater; +https://github.com/StevenLi-phoenix/ask)"})
     try:
         with urllib.request.urlopen(request, timeout=30) as resp:
-            payload = json.load(resp)
+            text = resp.read(8_000_000).decode("utf-8", errors="replace")
     except urllib.error.HTTPError as e:
         e.close()
-        raise ProviderError(f"{provider.name}: HTTP {e.code} from {provider.models_url}") from None
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as e:
-        raise ProviderError(f"{provider.name}: {type(e).__name__} fetching models") from None
-    return [m["id"] for m in payload.get("data", []) if isinstance(m.get("id"), str)]
+        raise ProviderError(f"{provider.name}: HTTP {e.code} from {provider.source_url}") from None
+    except (urllib.error.URLError, TimeoutError) as e:
+        raise ProviderError(f"{provider.name}: {type(e).__name__} fetching {provider.source_url}") from None
+    return extract_ids(text)
 
 
-def resolve(current, env, fetch):
-    """Return (new_defaults, notes). Providers without a key keep their current default."""
+def resolve(current, fetch):
+    """Return (new_defaults, notes)."""
     new, notes = dict(current), []
     for p in PROVIDERS:
-        key = env.get(p.key_env, "")
-        if not key:
-            notes.append(f"{p.name}: {p.key_env} not set, keeping {current.get(p.name)}")
-            continue
-        latest = pick_latest(fetch(p, key), p)
+        latest = pick_latest(fetch(p), p)
         new[p.name] = latest
         notes.append(f"{p.name}: {current.get(p.name)} -> {latest}" if latest != current.get(p.name)
                      else f"{p.name}: {latest} (unchanged)")
@@ -148,11 +143,8 @@ def main(argv=None):
 
     header = args.header.read_text()
     current = read_defaults(header)
-    if not any(os.environ.get(p.key_env) for p in PROVIDERS):
-        print("::error::no provider API key in the environment, nothing was checked", file=sys.stderr)
-        return 1
     try:
-        new, notes = resolve(current, os.environ, fetch_ids)
+        new, notes = resolve(current, fetch_ids)
     except (NoMatch, ProviderError) as e:
         print(f"::error::{e}", file=sys.stderr)
         return 1
