@@ -12,6 +12,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <optional>
 #include <pwd.h>
 #include <signal.h>
@@ -26,10 +27,10 @@
 
 #include <curl/curl.h>
 #include "vendor/cjson/cJSON.h"
+#include "default_models.h"
 
 namespace {
 
-constexpr const char *DEFAULT_MODEL = "gpt-5.5";
 constexpr const char *DEFAULT_REASONING_EFFORT = "none";
 constexpr size_t MAX_BUFFER_SIZE = 8192;
 constexpr int DEFAULT_TOKEN_LIMIT = 128000;
@@ -71,6 +72,48 @@ constexpr const char *COMMAND_TOOLS_JSON = R"([{
     }
   }
 }])";
+
+// All providers speak the OpenAI chat-completions dialect (Anthropic through its
+// OpenAI SDK compatibility endpoint).
+struct Provider {
+    const char *name;
+    const char *aliases[2];   // extra `-m` names that select the provider default (nullptr-terminated)
+    const char *baseUrl;
+    const char *keyEnv;
+    const char *defaultModel;
+    const char *modelPrefix;  // ids starting with this belong to the provider, or nullptr
+    bool sendsReasoningEffort;
+};
+
+constexpr Provider PROVIDERS[] = {
+    {"openai", {nullptr, nullptr}, "https://api.openai.com/v1", "OPENAI_API_KEY", OPENAI_DEFAULT_MODEL, nullptr, true},
+    {"anthropic", {"claude", "haiku"}, "https://api.anthropic.com/v1", "ANTHROPIC_API_KEY", ANTHROPIC_DEFAULT_MODEL, "claude-", false},
+    {"deepseek", {"flash", nullptr}, "https://api.deepseek.com", "DEEPSEEK_API_KEY", DEEPSEEK_DEFAULT_MODEL, "deepseek", false},
+};
+
+constexpr size_t OPENAI_PROVIDER = 0;   // takes ids that carry no other provider's prefix
+constexpr size_t DEFAULT_PROVIDER = 1;  // Anthropic: answers when no model was asked for
+
+struct ModelChoice {
+    const Provider *provider;
+    std::string model;
+};
+
+// Provider name or alias (claude, haiku, flash...) -> that provider's default model; a known id prefix -> the id
+// unchanged on its provider; empty -> the default provider's model; any other id -> OpenAI.
+ModelChoice resolveModel(const std::string &requested) {
+    if (requested.empty()) return {&PROVIDERS[DEFAULT_PROVIDER], PROVIDERS[DEFAULT_PROVIDER].defaultModel};
+    for (const auto &p : PROVIDERS) {
+        if (requested == p.name) return {&p, p.defaultModel};
+        for (const char *alias : p.aliases) {
+            if (alias && requested == alias) return {&p, p.defaultModel};
+        }
+    }
+    for (const auto &p : PROVIDERS) {
+        if (p.modelPrefix && requested.rfind(p.modelPrefix, 0) == 0) return {&p, requested};
+    }
+    return {&PROVIDERS[OPENAI_PROVIDER], requested};
+}
 
 volatile sig_atomic_t g_shutdownSignal = 0;
 volatile sig_atomic_t g_requestInFlight = 0;
@@ -256,7 +299,11 @@ private:
 
 struct Settings {
     std::string apiKey;
+    bool apiKeyFromCli{false};
     std::string model;
+    const Provider *provider{&PROVIDERS[DEFAULT_PROVIDER]};
+    std::string baseUrl{PROVIDERS[DEFAULT_PROVIDER].baseUrl};
+    bool validateModel{true};  // only the official OpenAI endpoint has a models list to check against
     std::string systemPrompt;
     int tokenLimit = DEFAULT_TOKEN_LIMIT;
     int fileSizeLimit = 10000;
@@ -273,18 +320,22 @@ public:
             return path;
         }
 
-        struct passwd *pw = getpwuid(getuid());
-        if (pw == nullptr) {
-            logger.log(LogLevel::Error, "Could not determine home directory");
-            return path;
-        }
+        std::string expanded;
+        if (const char *envHome = std::getenv("HOME"); envHome && *envHome) {
+            expanded = envHome;
+        } else {
+            struct passwd *pw = getpwuid(getuid());
+            if (pw == nullptr) {
+                logger.log(LogLevel::Error, "Could not determine home directory");
+                return path;
+            }
 
-        if (pw->pw_dir == nullptr) {
-            logger.log(LogLevel::Error, "Home directory path is null");
-            return path;
+            if (pw->pw_dir == nullptr) {
+                logger.log(LogLevel::Error, "Home directory path is null");
+                return path;
+            }
+            expanded = pw->pw_dir;
         }
-
-        std::string expanded = pw->pw_dir;
         expanded += path.substr(1);
 
         auto lastSlash = expanded.find_last_of('/');
@@ -694,6 +745,11 @@ public:
         : logger_(logger), settings_(settings), cache_(cache) {}
 
     bool validateModel(CURL *curl, const std::string &model) {
+        if (!settings_.validateModel) {
+            logger_.log(LogLevel::Debug, "Skipping model validation for provider %s (%s)",
+                settings_.provider->name, settings_.baseUrl.c_str());
+            return true;
+        }
         bool cacheLoaded = cache_.load(logger_);
         if (!cacheLoaded || cache_.data().models.empty()) {
             if (!fetchModelsList(curl)) {
@@ -817,7 +873,9 @@ private:
             return {};
         }
         cJSON_AddStringToObject(root, "model", settings_.model.c_str());
-        cJSON_AddStringToObject(root, "reasoning_effort", DEFAULT_REASONING_EFFORT);
+        if (settings_.provider->sendsReasoningEffort) {
+            cJSON_AddStringToObject(root, "reasoning_effort", DEFAULT_REASONING_EFFORT);
+        }
         cJSON_AddNumberToObject(root, "temperature", temperature);
         cJSON_AddBoolToObject(root, "stream", stream);
 
@@ -876,6 +934,9 @@ private:
         }
 
         RequestStatus status = RequestStatus::Failed;
+        const std::string chatUrl = settings_.baseUrl + "/chat/completions";
+        logger_.log(LogLevel::Info, "Provider %s, endpoint %s", settings_.provider->name, chatUrl.c_str());
+
         int attempt = 0;
 
         while (attempt <= MAX_RETRIES) {
@@ -897,7 +958,7 @@ private:
             }
 
             curl_easy_reset(curl);
-            curl_easy_setopt(curl, CURLOPT_URL, "https://api.openai.com/v1/chat/completions");
+            curl_easy_setopt(curl, CURLOPT_URL, chatUrl.c_str());
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
@@ -1068,7 +1129,8 @@ private:
         std::string authHeader = "Authorization: Bearer " + settings_.apiKey;
         headers = curl_slist_append(headers, authHeader.c_str());
 
-        curl_easy_setopt(curl, CURLOPT_URL, "https://api.openai.com/v1/models");
+        const std::string modelsUrl = settings_.baseUrl + "/models";
+        curl_easy_setopt(curl, CURLOPT_URL, modelsUrl.c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
@@ -1162,7 +1224,7 @@ private:
             std::printf("Model '%s' not found. Did you mean '%s'?\n", invalidModel.c_str(), closestModel.c_str());
             logger_.log(LogLevel::Info, "Suggested alternative model: %s (distance: %d)", closestModel.c_str(), minDistance);
         } else {
-            std::printf("Model '%s' not found. Available models include: gpt-5.5, gpt-5.3-chat-latest, gpt-5.4\n", invalidModel.c_str());
+            std::printf("Model '%s' not found. The default is %s.\n", invalidModel.c_str(), OPENAI_DEFAULT_MODEL);
         }
     }
 
@@ -1318,7 +1380,8 @@ struct ParseOutcome {
 };
 
 std::string maskApiKey(const std::string &key) {
-    if (key.size() <= 8) return "****";
+    if (key.empty()) return "(not set)";
+    if (key.size() <= 12) return "**** (length:" + std::to_string(key.size()) + ")";
     return key.substr(0, 5) + "..." + key.substr(key.size() - 4);
 }
 
@@ -1453,24 +1516,45 @@ public:
     }
 
 private:
+    // Model comes from ASK_GLOBAL_MODEL (env, then .env); an empty model means "OpenAI default"
+    // and is resolved together with `-m` in applyProvider(). Keys are looked up per provider there.
     void loadEnvironment() {
-        if (const char *envApiKey = std::getenv("OPENAI_API_KEY")) {
-            settings_.apiKey = envApiKey;
-            logger_.log(LogLevel::Debug, "Loaded API key from environment");
-        }
-        if (const char *envModel = std::getenv("ASK_GLOBAL_MODEL")) {
+        if (const char *envModel = std::getenv("ASK_GLOBAL_MODEL"); envModel && *envModel) {
             settings_.model = envModel;
             logger_.log(LogLevel::Debug, "Loaded model from environment: %s", settings_.model.c_str());
         }
 
-        if ((settings_.apiKey.empty() || settings_.model.empty()) && access(".env", F_OK) == 0) {
+        if (access(".env", F_OK) == 0) {
             loadDotenv(".env");
         }
+    }
 
-        if (settings_.model.empty()) {
-            settings_.model = DEFAULT_MODEL;
-            logger_.log(LogLevel::Info, "Using default model: %s", DEFAULT_MODEL);
+    std::string lookupKey(const char *name) const {
+        if (const char *value = std::getenv(name); value && *value) return value;
+        auto it = dotenv_.find(name);
+        return it == dotenv_.end() ? std::string() : it->second;
+    }
+
+    // Settle provider, endpoint and API key once the final model (env / .env / -m) is known.
+    void applyProvider() {
+        ModelChoice choice = resolveModel(settings_.model);
+        settings_.provider = choice.provider;
+        settings_.model = choice.model;
+
+        const std::string customUrl = lookupKey("ASK_BASE_URL");  // environment, then .env
+        const bool custom = !customUrl.empty();
+        settings_.baseUrl = custom ? customUrl : choice.provider->baseUrl;
+        while (settings_.baseUrl.size() > 1 && settings_.baseUrl.back() == '/') settings_.baseUrl.pop_back();
+        settings_.validateModel = (choice.provider == &PROVIDERS[OPENAI_PROVIDER]) && !custom;
+
+        if (!settings_.apiKeyFromCli) {
+            // -t > ASK_MODEL_KEY (one key for whatever endpoint is selected) > the provider's own variable
+            const std::string globalKey = lookupKey("ASK_MODEL_KEY");
+            settings_.apiKey = globalKey.empty() ? lookupKey(choice.provider->keyEnv) : globalKey;
         }
+        logger_.log(LogLevel::Info, "Using provider %s, model %s, endpoint %s, key %s",
+            choice.provider->name, settings_.model.c_str(), settings_.baseUrl.c_str(),
+            settings_.apiKey.empty() ? "missing" : "present");
     }
 
     void loadDotenv(const std::string &filename) {
@@ -1489,24 +1573,50 @@ private:
             std::string key = line.substr(0, equalsPos);
             std::string value = line.substr(equalsPos + 1);
 
-            if (key == "OPENAI_API_KEY" && settings_.apiKey.empty()) {
-                settings_.apiKey = value;
-                logger_.log(LogLevel::Debug, "Loaded API key from .env");
-            } else if (key == "ASK_GLOBAL_MODEL" && settings_.model.empty()) {
-                settings_.model = value;
-                logger_.log(LogLevel::Debug, "Loaded model from .env: %s", settings_.model.c_str());
+            if (key == "ASK_GLOBAL_MODEL") {
+                if (settings_.model.empty()) {
+                    settings_.model = value;
+                    logger_.log(LogLevel::Debug, "Loaded model from .env: %s", settings_.model.c_str());
+                }
+            } else {
+                dotenv_[key] = value;
+                logger_.log(LogLevel::Debug, "Loaded %s from .env", key.c_str());
             }
         }
     }
 
-    void saveEnvFile() {
-        std::string content = "OPENAI_API_KEY=" + settings_.apiKey + "\n"
-            + "ASK_GLOBAL_MODEL=" + settings_.model + "\n";
+    // Rewrites .env with `updates` applied; every other line (other keys, comments) is kept.
+    void saveEnvFile(const std::map<std::string, std::string> &updates) {
+        std::vector<std::string> lines;
+        std::vector<std::string> written;
+        {
+            std::ifstream existing(".env");
+            std::string line;
+            while (std::getline(existing, line)) {
+                auto equalsPos = line.find('=');
+                if (equalsPos != std::string::npos) {
+                    auto it = updates.find(line.substr(0, equalsPos));
+                    if (it != updates.end()) {
+                        line = it->first + "=" + it->second;
+                        written.push_back(it->first);
+                    }
+                }
+                lines.push_back(line);
+            }
+        }
+        for (const auto &kv : updates) {
+            if (std::find(written.begin(), written.end(), kv.first) == written.end()) {
+                lines.push_back(kv.first + "=" + kv.second);
+            }
+        }
+
+        std::string content;
+        for (const auto &line : lines) content += line + "\n";
         if (!FileUtil::writeSecureFile(".env", content, logger_)) {
             logger_.log(LogLevel::Error, "Failed to save .env file");
             return;
         }
-        logger_.log(LogLevel::Info, "Saved API key and model settings to .env file");
+        logger_.log(LogLevel::Info, "Updated %zu setting(s) in .env", updates.size());
     }
 
     static bool parseLogLevel(const char *level, LogLevel &outLevel) {
@@ -1738,9 +1848,10 @@ private:
                     return outcome;
                 }
                 settings_.apiKey = argv[++i];
+                settings_.apiKeyFromCli = true;
                 std::memset(argv[i], '*', std::strlen(argv[i]));
                 std::fprintf(stderr, "Warning: passing API key via --token exposes it in the process list.\n"
-                    "  Consider using OPENAI_API_KEY environment variable or --setAPIKey instead.\n");
+                    "  Consider using the provider's API key environment variable or --setAPIKey instead.\n");
                 logger_.log(LogLevel::Debug, "Set API key from command line");
             } else if (std::strcmp(argv[i], "--model") == 0 || std::strcmp(argv[i], "-m") == 0) {
                 if (i + 1 >= argc) {
@@ -1783,13 +1894,18 @@ private:
             }
         }
 
+        applyProvider();
+
         if (setApiKey || setModel) {
-            if (setModel) settings_.model = newModel;
-            if (setApiKey) settings_.apiKey = newApiKey;
-            saveEnvFile();
+            // The key is stored under the variable of the provider that will be active afterwards.
+            const Provider *target = resolveModel(setModel ? newModel : settings_.model).provider;
+            std::map<std::string, std::string> updates;
+            if (setModel) updates["ASK_GLOBAL_MODEL"] = newModel;
+            if (setApiKey) updates[target->keyEnv] = newApiKey;
+            saveEnvFile(updates);
             logger_.log(LogLevel::Info, "Updated configuration saved to .env file");
-            if (setApiKey) std::cout << "API key saved to .env\n";
-            if (setModel) std::cout << "Model set to " << settings_.model << " and saved to .env\n";
+            if (setApiKey) std::cout << target->keyEnv << " saved to .env\n";
+            if (setModel) std::cout << "Model set to " << newModel << " and saved to .env\n";
             outcome.shouldExit = true;
             outcome.exitCode = 0;
             return outcome;
@@ -1797,6 +1913,7 @@ private:
 
         if (showVersion || settings_.debugMode) {
             std::cout << "OpenAI Chatbot\n";
+            std::cout << "Provider: " << settings_.provider->name << " (" << settings_.baseUrl << ")\n";
             std::cout << "Model: " << settings_.model << "\n";
             std::cout << "API Key: " << maskApiKey(settings_.apiKey) << "\n";
             std::cout << "Token Limit: " << settings_.tokenLimit << "\n";
@@ -1821,7 +1938,7 @@ private:
         outcome.tokenCountOnly = showTokenCount;
 
         if (settings_.apiKey.empty() && !outcome.tokenCountOnly) {
-            std::fprintf(stderr, "API Key not found. Set OPENAI_API_KEY or use --setAPIKey.\n");
+            std::fprintf(stderr, "API Key not found. Set %s (or ASK_MODEL_KEY) or use --setAPIKey.\n", settings_.provider->keyEnv);
             outcome.shouldExit = true;
             outcome.exitCode = 1;
         }
@@ -1843,8 +1960,9 @@ private:
         std::cout << "      --no-stream        Disable streaming output (wait for complete response)\n";
         std::cout << "      --raw              Raw output mode (no spinner, minimal formatting)\n";
         std::cout << "  -s, --system PROMPT    Set custom system prompt\n";
-        std::cout << "  -t, --token TOKEN      Set OpenAI API token\n";
-        std::cout << "  -m, --model MODEL      Set model to use (default: " << DEFAULT_MODEL << ")\n";
+        std::cout << "  -t, --token TOKEN      Set API token for the selected provider\n";
+        std::cout << "  -m, --model MODEL      Set model: an id, or openai / claude / deepseek (or haiku / flash)\n";
+        std::cout << "                         for that provider's default (default: " << ANTHROPIC_DEFAULT_MODEL << ")\n";
         std::cout << "  -T, --temperature VAL  Set temperature (0.0-2.0, default: 1.0)\n";
         std::cout << "  -l, --tokenLimit NUM   Set token limit (default: " << DEFAULT_TOKEN_LIMIT << ")\n";
         std::cout << "  -F, --fileLimit NUM    Set @file size limit in bytes (default: 10000)\n";
@@ -1860,7 +1978,8 @@ private:
         std::cout << "  ask -s \"You are a pirate\" \"Hello there\"\n";
         std::cout << "  echo \"some code\" | ask \"explain this\"\n";
         std::cout << "  ask -x \"iptables show all rules\"\n";
-        std::cout << "  ask --model gpt-5.5 --temperature 0.8 \"Write a poem about AI\"\n";
+        std::cout << "  ask --model haiku --temperature 0.8 \"Write a poem about AI\"\n";
+        std::cout << "  ask -m flash \"Summarize @README.md\"\n";
     }
 
     void printUsageHint() {
@@ -2129,6 +2248,7 @@ private:
     }
 
     Settings settings_{};
+    std::map<std::string, std::string> dotenv_;
     Logger logger_;
     ModelsCacheManager cacheManager_{};
     ContextManager contextManager_{};

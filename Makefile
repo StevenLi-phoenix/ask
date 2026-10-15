@@ -15,7 +15,7 @@ all: $(BIN)
 $(CJSON_OBJ): $(CJSON_SRC)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-$(BIN): $(SRC) $(CJSON_OBJ)
+$(BIN): $(SRC) $(CJSON_OBJ) default_models.h
 	$(CXX) $(CXXFLAGS) $(LDFLAGS) -o $(BIN) $(SRC) $(CJSON_OBJ) $(LIBS)
 
 clean:
