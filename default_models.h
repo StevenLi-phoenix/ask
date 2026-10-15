@@ -4,5 +4,5 @@
 #pragma once
 
 constexpr const char *OPENAI_DEFAULT_MODEL = "gpt-6-luna";
-constexpr const char *ANTHROPIC_DEFAULT_MODEL = "claude-haiku-4-5";
+constexpr const char *ANTHROPIC_DEFAULT_MODEL = "claude-haiku-5-5";
 constexpr const char *DEEPSEEK_DEFAULT_MODEL = "deepseek-flash";
