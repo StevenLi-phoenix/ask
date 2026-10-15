@@ -1,0 +1,72 @@
+name: Update default models
+
+# Weekly: ask each provider which cheap-tier model is newest (scripts/update_default_models.py),
+# and if default_models.h would change, build + test and open a PR.
+# Needs repo secrets OPENAI_API_KEY / ANTHROPIC_API_KEY / DEEPSEEK_API_KEY (listing models
+# is all they are used for; a provider without a secret is skipped). Opening the PR needs
+# Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
+
+on:
+  schedule:
+    - cron: "17 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-default-models
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Resolve latest default models
+        id: resolve
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: python3 scripts/update_default_models.py | tee "$RUNNER_TEMP/notes.txt"
+
+      - name: Install build dependencies
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential libcurl4-openssl-dev
+
+      # PRs opened with GITHUB_TOKEN do not trigger other workflows, so test here.
+      - name: Build and test
+        if: steps.resolve.outputs.changed == 'true'
+        run: |
+          make clean && make
+          python3 -I tests/test_update_default_models.py
+          tests/run.sh
+
+      - name: Open pull request
+        if: steps.resolve.outputs.changed == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          open=$(gh pr list --state open --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("auto/default-models-"))] | length')
+          if [ "$open" != "0" ]; then
+            echo "A default-models PR is already open; leaving it to be merged or closed first."
+            exit 0
+          fi
+          branch="auto/default-models-$(date -u +%Y%m%d)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$branch"
+          git add default_models.h README.md
+          git commit -m "chore: bump default models" -m "$(cat "$RUNNER_TEMP/notes.txt")"
+          git push -u origin "$branch"
+          gh pr create --title "chore: bump default models" \
+            --body "$(printf 'Weekly resolve by `scripts/update_default_models.py`:\n\n```\n%s\n```\n\nBuild, `tests/run.sh` and the unit tests passed in the workflow before this PR was opened.' "$(cat "$RUNNER_TEMP/notes.txt")")"
