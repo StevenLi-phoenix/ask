@@ -66,10 +66,10 @@ jobs:
           branch="auto/default-models-$(date -u +%Y%m%d)"
           git checkout -b "$branch"
           git add default_models.h README.md
-          # The script only writes these two files; anything else means something is off.
-          files=$(git diff --cached --name-only | sort | tr '\n' ' ')
-          if [ "$files" != "README.md default_models.h " ]; then
-            echo "::error::unexpected files in the bump: $files"
+          # The script only ever writes these two files; anything else means something is off.
+          other=$(git diff --cached --name-only | grep -vxE 'README\.md|default_models\.h' || true)
+          if [ -n "$other" ]; then
+            echo "::error::unexpected files in the bump: $other"
             git status --short
             exit 1
           fi
