@@ -3,6 +3,7 @@ import dataclasses
 import importlib.util
 import json
 import pathlib
+import socketserver
 import threading
 import unittest
 import urllib.error
@@ -96,6 +97,15 @@ class Resolve(unittest.TestCase):
             udm.resolve({"openai": "x"}, {"OPENAI_API_KEY": "k"}, boom)
 
 
+class QuickServer(HTTPServer):
+    """Skips HTTPServer.server_bind()'s socket.getfqdn(), a slow reverse DNS lookup on CI runners."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
 class Fetch(unittest.TestCase):
     """fetch_ids against a local server: auth header style per provider, parsing, error mapping."""
 
@@ -114,8 +124,9 @@ class Fetch(unittest.TestCase):
             def log_message(self, *args):
                 pass
 
-        server = HTTPServer(("127.0.0.1", 0), Handler)
+        server = QuickServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         return f"http://127.0.0.1:{server.server_port}/v1/models", seen
 

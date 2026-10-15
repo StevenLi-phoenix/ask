@@ -6,6 +6,7 @@ Every POST is appended to REQUEST_LOG as one JSON line; GETs (e.g. /models) 404.
 """
 import json
 import sys
+import socketserver
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 request_log, port_file = sys.argv[1], sys.argv[2]
@@ -42,7 +43,17 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-server = HTTPServer(("127.0.0.1", 0), Handler)
+class QuickServer(HTTPServer):
+    """HTTPServer.server_bind() calls socket.getfqdn(), a reverse DNS lookup that takes
+    ~10s on CI runners; the tests only need the bound port."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
+
+
+server = QuickServer(("127.0.0.1", 0), Handler)
 with open(port_file, "w") as f:
     f.write(str(server.server_port))
 server.serve_forever()

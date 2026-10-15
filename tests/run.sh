@@ -17,7 +17,8 @@ mkdir -p "$TMP/home" "$TMP/work"
 LOG=$TMP/requests.jsonl
 python3 -I "$ROOT/tests/mock_server.py" "$LOG" "$TMP/port" &
 SERVER_PID=$!
-for _ in $(seq 50); do [ -s "$TMP/port" ] && break; sleep 0.1; done
+for _ in $(seq 150); do [ -s "$TMP/port" ] && break; sleep 0.1; done
+[ -s "$TMP/port" ] || { echo "mock server did not start within 15s"; exit 1; }
 PORT=$(cat "$TMP/port")
 
 default_of() { sed -n "s/.*${1}_DEFAULT_MODEL = \"\\(.*\\)\";/\\1/p" "$ROOT/default_models.h"; }
