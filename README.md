@@ -183,7 +183,7 @@ Token counting is approximate. Streaming prints chunks as they arrive and falls 
 
 ## Default model updates
 
-`.github/workflows/update-default-models.yml` runs every Monday (and on demand). `scripts/update_default_models.py` reads one public documentation page per provider, no API keys or secrets involved, keeps the model ids that match that provider's cheap-tier name pattern (`PROVIDERS` in the script) and takes the highest version. If anything changed it rewrites `default_models.h` and the table above, builds, runs the tests and opens a `chore: bump default models` PR.
+`.github/workflows/update-default-models.yml` runs every Monday (and on demand). `scripts/update_default_models.py` reads one public documentation page per provider, no API keys or secrets involved, keeps the model ids that match that provider's cheap-tier name pattern (`PROVIDERS` in the script) and takes the highest version. If anything changed it rewrites `default_models.h` and the table above, builds, runs the tests, opens a `chore: bump default models` PR, runs `ci.yml` on the PR branch (Ubuntu and macOS) and squash-merges the PR once that is green. If CI fails the PR stays open and the run goes red. Only `default_models.h` and `README.md` may change in such a PR. Merging does not cut a release: tag one when you want the new default in the binary.
 
 Setup, once: let Actions open pull requests.
 

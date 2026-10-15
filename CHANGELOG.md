@@ -5,6 +5,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- The default-model updater now runs CI on its PR branch and squash-merges the PR automatically once it is green.
+
 ### Changed
 - The default-model updater reads each provider's public documentation page instead of calling authenticated model-list APIs, so the workflow needs no repository secrets.
 

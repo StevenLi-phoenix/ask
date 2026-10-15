@@ -2,8 +2,10 @@ name: Update default models
 
 # Weekly: read each provider's public docs page for its newest cheap-tier model
 # (scripts/update_default_models.py; no API keys, no secrets) and, if default_models.h
-# would change, build + test and open a PR. Opening the PR needs
-# Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
+# would change, build + test, open a PR, run ci.yml on its branch (macOS + Ubuntu) and
+# squash-merge it once that is green. If CI fails the PR stays open and this run goes red.
+# Needs Settings > Actions > General > "Allow GitHub Actions to create and approve pull requests".
+# (A PR opened with GITHUB_TOKEN does not trigger ci.yml by itself, hence the explicit dispatch.)
 
 on:
   schedule:
@@ -13,6 +15,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  actions: write
 
 concurrency:
   group: update-default-models
@@ -21,6 +24,7 @@ concurrency:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -44,7 +48,7 @@ jobs:
           python3 -I tests/test_update_default_models.py
           tests/run.sh
 
-      - name: Open pull request
+      - name: Open pull request, wait for CI, merge
         if: steps.resolve.outputs.changed == 'true'
         shell: bash
         env:
@@ -56,12 +60,37 @@ jobs:
             echo "A default-models PR is already open; leaving it to be merged or closed first."
             exit 0
           fi
-          branch="auto/default-models-$(date -u +%Y%m%d)"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          branch="auto/default-models-$(date -u +%Y%m%d)"
           git checkout -b "$branch"
           git add default_models.h README.md
+          # The script only writes these two files; anything else means something is off.
+          files=$(git diff --cached --name-only | sort | tr '\n' ' ')
+          if [ "$files" != "README.md default_models.h " ]; then
+            echo "::error::unexpected files in the bump: $files"
+            git status --short
+            exit 1
+          fi
           git commit -m "chore: bump default models" -m "$(cat "$RUNNER_TEMP/notes.txt")"
           git push -u origin "$branch"
-          gh pr create --title "chore: bump default models" \
-            --body "$(printf 'Weekly resolve by `scripts/update_default_models.py`:\n\n```\n%s\n```\n\nBuild, `tests/run.sh` and the unit tests passed in the workflow before this PR was opened.' "$(cat "$RUNNER_TEMP/notes.txt")")"
+          url=$(gh pr create --base "$GITHUB_REF_NAME" --title "chore: bump default models" \
+            --body "$(printf 'Resolved by `scripts/update_default_models.py` from the providers'"'"' public docs pages:\n\n```\n%s\n```\n\nci.yml is dispatched on this branch and the PR is squash-merged when it is green.' "$(cat "$RUNNER_TEMP/notes.txt")")")
+          echo "Opened $url"
+
+          gh workflow run ci.yml --ref "$branch"
+          run_id=""
+          for _ in $(seq 30); do
+            run_id=$(gh run list --workflow ci.yml --branch "$branch" --event workflow_dispatch \
+              --limit 1 --json databaseId --jq '.[0].databaseId // empty')
+            [ -n "$run_id" ] && break
+            sleep 5
+          done
+          [ -n "$run_id" ] || { echo "::error::the CI run did not appear"; exit 1; }
+          echo "Waiting for CI run $run_id"
+          if ! gh run watch "$run_id" --interval 15 --exit-status; then
+            echo "::error::CI failed on $branch; $url stays open for a human"
+            exit 1
+          fi
+          gh pr merge "$url" --squash --delete-branch
